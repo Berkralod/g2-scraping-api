@@ -1,0 +1,984 @@
+openapi: 3.0.3
+
+info:
+  title: G2 Scraping API
+  description: |
+    Real-time G2 product data — ratings, reviews, features, pricing, alternatives, search, and category browsing.
+
+    **Data sources:**
+    - `rating_schema.json` public endpoint (0 credits) — name, rating, review count, categories
+    - Google SERP via ScraperAPI — star distribution, review snippets, features, pricing, competitors
+
+    **Cache TTLs:** product/features/pricing/alternatives 24h · reviews 6h · search/category 2h
+  version: "1.0.0"
+  contact:
+    name: ZERONE INTERNATIONAL LLC
+    email: berkdivaroren@gmail.com
+
+servers:
+  - url: https://g2-scraping-api.up.railway.app
+    description: Production
+
+tags:
+  - name: Product
+    description: Product profile, rating, and review count
+  - name: Reviews
+    description: Review text snippets extracted from G2
+  - name: Features
+    description: Feature list for a product
+  - name: Pricing
+    description: Pricing tiers and free plan/trial detection
+  - name: Alternatives
+    description: Competitor products from G2 compare pages
+  - name: Search
+    description: Search G2 products by keyword or category
+  - name: Category
+    description: Browse products by G2 category slug
+  - name: Health
+    description: API health check
+
+security:
+  - RapidApiKey: []
+    RapidApiHost: []
+
+paths:
+
+  /health:
+    get:
+      tags: [Health]
+      summary: Health check
+      description: Returns API status and version. No authentication required.
+      security: []
+      operationId: getHealth
+      responses:
+        "200":
+          description: API is healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              example:
+                status: ok
+                api: G2 Scraping API
+                version: "1.0.0"
+                timestamp: "2026-04-22T10:00:00.000000"
+
+  /g2/product:
+    get:
+      tags: [Product]
+      summary: Get product details
+      description: |
+        Returns name, overall rating (5-star scale), total review count, star distribution, G2 categories, and description for a G2 product.
+
+        Primary source is G2's public `rating_schema.json` endpoint (fast, 0 SERP credits). Star distribution and description come from a supplemental SERP call.
+      operationId: getProduct
+      parameters:
+        - $ref: "#/components/parameters/slug"
+      responses:
+        "200":
+          description: Product data returned successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProductResponse"
+              example:
+                status: success
+                cache: MISS
+                data:
+                  slug: slack
+                  name: Slack
+                  rating: 4.5
+                  total_reviews: 38465
+                  stars_distribution:
+                    "5": 75
+                    "4": 19
+                    "3": 4
+                    "2": 1
+                    "1": 1
+                  categories:
+                    - Team Collaboration
+                    - Business Instant Messaging
+                  description: "Slack is a channel-based messaging platform. With Slack, people can work together more effectively..."
+                  platform: g2
+                  profile_url: https://www.g2.com/products/slack/reviews
+                  scraped_at: "2026-04-22T10:00:00.000000"
+        "400":
+          $ref: "#/components/responses/MissingParameter"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ScraperError"
+
+  /g2/reviews:
+    get:
+      tags: [Reviews]
+      summary: Get review snippets
+      description: |
+        Returns review text snippets for a G2 product extracted from two SERP sources:
+        1. Product reviews page (`site:g2.com/products/{slug}/reviews`)
+        2. Structured review snippets (`"What do you like best about {name}" site:g2.com`)
+
+        **Limitation:** Individual star ratings, review dates, and author names are not available through SERP extraction. The `rating` field will always be `0` and `author` will be `"Anonymous"`.
+
+        Maximum `limit` is 40.
+      operationId: getReviews
+      parameters:
+        - $ref: "#/components/parameters/slug"
+        - name: limit
+          in: query
+          description: Number of review snippets to return (max 40)
+          required: false
+          schema:
+            type: integer
+            default: 20
+            minimum: 1
+            maximum: 40
+          example: 20
+        - name: rating
+          in: query
+          description: Filter by star rating (1–5). Note — currently accepted but not enforced due to SERP data limitations.
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 5
+          example: 5
+        - name: sort
+          in: query
+          description: Sort order hint (passed through; SERP results are always ordered by relevance)
+          required: false
+          schema:
+            type: string
+            default: most_recent
+            enum: [most_recent, most_helpful, highest_rated, lowest_rated]
+          example: most_recent
+      responses:
+        "200":
+          description: Review snippets returned successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReviewsResponse"
+              example:
+                status: success
+                cache: MISS
+                data:
+                  slug: slack
+                  returned: 3
+                  note: "Individual ratings/dates/authors not available via SERP extraction"
+                  platform: g2
+                  reviews:
+                    - id: g2-serp-0
+                      rating: 0
+                      title: ""
+                      pros: ""
+                      cons: ""
+                      text: "Slack is a great tool for team communication. The channel-based approach keeps conversations organized."
+                      date: ""
+                      author: Anonymous
+                      author_title: ""
+                      verified: false
+                      helpful_votes: 0
+                      platform: g2
+                    - id: g2-text-1
+                      rating: 0
+                      title: "Slack Review — Verified User"
+                      pros: "The integrations with other tools are excellent. Search functionality is very powerful."
+                      cons: "Can get noisy without good channel discipline."
+                      text: "What do you like best about Slack? The integrations with other tools are excellent..."
+                      date: ""
+                      author: Anonymous
+                      author_title: ""
+                      verified: false
+                      helpful_votes: 0
+                      platform: g2
+        "400":
+          $ref: "#/components/responses/MissingParameter"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ScraperError"
+
+  /g2/features:
+    get:
+      tags: [Features]
+      summary: Get feature list
+      description: |
+        Returns the list of features for a G2 product, extracted from the `g2.com/products/{slug}/features` SERP results.
+
+        Features are parsed from SERP snippets and deduplicated. Results are cached for 24 hours.
+      operationId: getFeatures
+      parameters:
+        - $ref: "#/components/parameters/slug"
+      responses:
+        "200":
+          description: Feature list returned successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FeaturesResponse"
+              example:
+                status: success
+                cache: MISS
+                data:
+                  slug: slack
+                  features:
+                    - Messaging
+                    - File Sharing
+                    - Audio/Video Conferencing
+                    - Screen Sharing
+                    - Workflow Automation
+                    - App Integrations
+                    - Search
+                    - Channels
+                    - Direct Messages
+                    - Guest Access
+                  feature_count: 10
+                  platform: g2
+                  scraped_at: "2026-04-22T10:00:00.000000"
+        "400":
+          $ref: "#/components/responses/MissingParameter"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ScraperError"
+
+  /g2/pricing:
+    get:
+      tags: [Pricing]
+      summary: Get pricing information
+      description: |
+        Returns pricing tiers and plan details for a G2 product, extracted from the `g2.com/products/{slug}/pricing` SERP results.
+
+        Includes structured tier/price pairs parsed from snippets, plus boolean flags for free plan and free trial availability.
+      operationId: getPricing
+      parameters:
+        - $ref: "#/components/parameters/slug"
+      responses:
+        "200":
+          description: Pricing information returned successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PricingResponse"
+              example:
+                status: success
+                cache: MISS
+                data:
+                  slug: slack
+                  pricing_tiers:
+                    - name: Pro Plan
+                      price: "$7.25/mo"
+                    - name: Business Plus Plan
+                      price: "$12.50/mo"
+                    - name: Enterprise Grid
+                      price: "$0"
+                  has_free_plan: true
+                  has_free_trial: true
+                  raw_snippet: "Slack pricing starts at $7.25/month per user for the Pro Plan. A free plan is available with limited features..."
+                  platform: g2
+                  scraped_at: "2026-04-22T10:00:00.000000"
+        "400":
+          $ref: "#/components/responses/MissingParameter"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ScraperError"
+
+  /g2/alternatives:
+    get:
+      tags: [Alternatives]
+      summary: Get competitor / alternative products
+      description: |
+        Returns competitor products found on G2's compare pages (`g2.com/compare/{slug}-vs-*`).
+
+        Each result includes the competitor's G2 slug, display name, profile URL, and a direct comparison URL.
+      operationId: getAlternatives
+      parameters:
+        - $ref: "#/components/parameters/slug"
+        - name: limit
+          in: query
+          description: Maximum number of alternatives to return (max 20)
+          required: false
+          schema:
+            type: integer
+            default: 5
+            minimum: 1
+            maximum: 20
+          example: 5
+      responses:
+        "200":
+          description: Alternatives returned successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AlternativesResponse"
+              example:
+                status: success
+                cache: MISS
+                data:
+                  slug: slack
+                  returned: 3
+                  platform: g2
+                  scraped_at: "2026-04-22T10:00:00.000000"
+                  alternatives:
+                    - name: Microsoft Teams
+                      slug: microsoft-teams
+                      rating: 0.0
+                      profile_url: https://www.g2.com/products/microsoft-teams/reviews
+                      compare_url: https://www.g2.com/compare/slack-vs-microsoft-teams
+                      platform: g2
+                    - name: Zoom
+                      slug: zoom
+                      rating: 0.0
+                      profile_url: https://www.g2.com/products/zoom/reviews
+                      compare_url: https://www.g2.com/compare/slack-vs-zoom
+                      platform: g2
+        "400":
+          $ref: "#/components/responses/MissingParameter"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ScraperError"
+
+  /g2/search:
+    get:
+      tags: [Search]
+      summary: Search G2 products
+      description: |
+        Searches G2 for software products matching a keyword query, optionally filtered by category.
+
+        Results include product name, slug, rating (when available in snippets), short description, and G2 profile URL. Only product review pages are returned — category and comparison pages are filtered out.
+      operationId: searchProducts
+      parameters:
+        - name: q
+          in: query
+          description: Search query — software name or keyword (e.g. "project management", "CRM", "Notion")
+          required: true
+          schema:
+            type: string
+          example: project management
+        - name: category
+          in: query
+          description: Optional category to narrow results (e.g. "collaboration", "analytics", "HR")
+          required: false
+          schema:
+            type: string
+          example: collaboration
+        - name: limit
+          in: query
+          description: Maximum number of products to return (max 30)
+          required: false
+          schema:
+            type: integer
+            default: 10
+            minimum: 1
+            maximum: 30
+          example: 10
+      responses:
+        "200":
+          description: Search results returned successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SearchResponse"
+              example:
+                status: success
+                cache: MISS
+                data:
+                  query: project management
+                  category: null
+                  total_found: 5
+                  platform: g2
+                  results:
+                    - name: Asana
+                      slug: asana
+                      rating: 4.4
+                      description: "Asana is a project management tool that helps teams organize..."
+                      profile_url: https://www.g2.com/products/asana/reviews
+                      platform: g2
+                    - name: Monday.com
+                      slug: monday-com
+                      rating: 4.7
+                      description: "monday.com is a cloud-based Work OS that powers teams..."
+                      profile_url: https://www.g2.com/products/monday-com/reviews
+                      platform: g2
+        "400":
+          $ref: "#/components/responses/MissingParameter"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ScraperError"
+
+  /g2/category:
+    get:
+      tags: [Category]
+      summary: Browse products by G2 category
+      description: |
+        Returns products listed under a specific G2 category, identified by its URL slug (e.g. `team-collaboration`, `crm`, `project-management`).
+
+        Use G2's category URL to find the slug: `g2.com/categories/{slug}`.
+      operationId: getCategory
+      parameters:
+        - name: slug
+          in: query
+          description: G2 category slug (from `g2.com/categories/{slug}`)
+          required: true
+          schema:
+            type: string
+          example: team-collaboration
+        - name: limit
+          in: query
+          description: Maximum number of products to return (max 30)
+          required: false
+          schema:
+            type: integer
+            default: 10
+            minimum: 1
+            maximum: 30
+          example: 10
+      responses:
+        "200":
+          description: Category products returned successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CategoryResponse"
+              example:
+                status: success
+                cache: MISS
+                data:
+                  category_slug: team-collaboration
+                  category_url: https://www.g2.com/categories/team-collaboration
+                  total_found: 5
+                  platform: g2
+                  scraped_at: "2026-04-22T10:00:00.000000"
+                  products:
+                    - name: Slack
+                      slug: slack
+                      rating: 4.5
+                      description: "Slack is a channel-based messaging platform..."
+                      profile_url: https://www.g2.com/products/slack/reviews
+                      platform: g2
+                    - name: Microsoft Teams
+                      slug: microsoft-teams
+                      rating: 4.3
+                      description: "Microsoft Teams is a hub for teamwork in Microsoft 365..."
+                      profile_url: https://www.g2.com/products/microsoft-teams/reviews
+                      platform: g2
+        "400":
+          $ref: "#/components/responses/MissingParameter"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/ScraperError"
+
+components:
+
+  securitySchemes:
+    RapidApiKey:
+      type: apiKey
+      in: header
+      name: X-RapidAPI-Key
+      description: Your RapidAPI key
+    RapidApiHost:
+      type: apiKey
+      in: header
+      name: X-RapidAPI-Host
+      description: API host identifier provided by RapidAPI
+
+  parameters:
+    slug:
+      name: slug
+      in: query
+      description: G2 product slug — the identifier in `g2.com/products/{slug}/reviews` (e.g. `slack`, `hubspot`, `monday-com`)
+      required: true
+      schema:
+        type: string
+      example: slack
+
+  responses:
+    MissingParameter:
+      description: Required parameter is missing
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error: missing_parameter
+            message: slug is required
+
+    Unauthorized:
+      description: Invalid or missing RapidAPI credentials
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error: Unauthorized
+            message: Access denied
+
+    ScraperError:
+      description: Scraping failed — upstream timeout or parsing error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ScraperErrorResponse"
+          examples:
+            timeout:
+              summary: Request timed out
+              value:
+                status: error
+                error_code: TIMEOUT
+                platform: g2
+                message: Request timed out
+            http_error:
+              summary: HTTP error from upstream
+              value:
+                status: error
+                error_code: HTTP_ERROR
+                platform: g2
+                message: "404 Client Error: Not Found"
+            scraper_error:
+              summary: General scraper failure
+              value:
+                status: error
+                error_code: SCRAPER_ERROR
+                platform: g2
+                message: Scraper failed
+                detail: "Connection refused"
+
+  schemas:
+
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: ok
+        api:
+          type: string
+          example: G2 Scraping API
+        version:
+          type: string
+          example: "1.0.0"
+        timestamp:
+          type: string
+          format: date-time
+          example: "2026-04-22T10:00:00.000000"
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+        message:
+          type: string
+
+    ScraperErrorResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [error]
+        error_code:
+          type: string
+          enum: [TIMEOUT, HTTP_ERROR, SCRAPER_ERROR]
+        platform:
+          type: string
+          example: g2
+        message:
+          type: string
+        detail:
+          type: string
+          description: Additional error detail (present for SCRAPER_ERROR only)
+
+    StarsDistribution:
+      type: object
+      description: Percentage of reviews at each star level
+      properties:
+        "5":
+          type: integer
+          example: 75
+        "4":
+          type: integer
+          example: 19
+        "3":
+          type: integer
+          example: 4
+        "2":
+          type: integer
+          example: 1
+        "1":
+          type: integer
+          example: 1
+
+    ProductData:
+      type: object
+      properties:
+        slug:
+          type: string
+          example: slack
+        name:
+          type: string
+          example: Slack
+        rating:
+          type: number
+          format: float
+          description: Overall rating on a 5-star scale
+          example: 4.5
+        total_reviews:
+          type: integer
+          example: 38465
+        stars_distribution:
+          $ref: "#/components/schemas/StarsDistribution"
+        categories:
+          type: array
+          items:
+            type: string
+          description: G2 category names this product belongs to
+          example: ["Team Collaboration", "Business Instant Messaging"]
+        description:
+          type: string
+          example: "Slack is a channel-based messaging platform..."
+        platform:
+          type: string
+          example: g2
+        profile_url:
+          type: string
+          format: uri
+          example: https://www.g2.com/products/slack/reviews
+        scraped_at:
+          type: string
+          format: date-time
+          example: "2026-04-22T10:00:00.000000"
+
+    ProductResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: success
+        cache:
+          type: string
+          enum: [HIT, MISS]
+          description: HIT = served from cache, MISS = freshly scraped
+        data:
+          $ref: "#/components/schemas/ProductData"
+
+    ReviewItem:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Synthetic review ID (format — g2-serp-N or g2-text-N)
+          example: g2-serp-0
+        rating:
+          type: integer
+          description: Star rating (always 0 — not available via SERP)
+          example: 0
+        title:
+          type: string
+          example: ""
+        pros:
+          type: string
+          description: Extracted pros text (available for g2-text-* items only)
+          example: "Great integrations and search functionality"
+        cons:
+          type: string
+          description: Extracted cons text (available for g2-text-* items only)
+          example: "Can get noisy without channel discipline"
+        text:
+          type: string
+          description: Full review snippet text (max 1000 chars)
+          example: "Slack is a great tool for team communication..."
+        date:
+          type: string
+          description: Review date (always empty — not available via SERP)
+          example: ""
+        author:
+          type: string
+          description: Reviewer name (always Anonymous — not available via SERP)
+          example: Anonymous
+        author_title:
+          type: string
+          example: ""
+        verified:
+          type: boolean
+          example: false
+        helpful_votes:
+          type: integer
+          example: 0
+        platform:
+          type: string
+          example: g2
+
+    ReviewsData:
+      type: object
+      properties:
+        slug:
+          type: string
+          example: slack
+        returned:
+          type: integer
+          example: 20
+        note:
+          type: string
+          example: "Individual ratings/dates/authors not available via SERP extraction"
+        platform:
+          type: string
+          example: g2
+        reviews:
+          type: array
+          items:
+            $ref: "#/components/schemas/ReviewItem"
+
+    ReviewsResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: success
+        cache:
+          type: string
+          enum: [HIT, MISS]
+        data:
+          $ref: "#/components/schemas/ReviewsData"
+
+    FeaturesData:
+      type: object
+      properties:
+        slug:
+          type: string
+          example: slack
+        features:
+          type: array
+          items:
+            type: string
+          example: ["Messaging", "File Sharing", "Workflow Automation"]
+        feature_count:
+          type: integer
+          example: 10
+        platform:
+          type: string
+          example: g2
+        scraped_at:
+          type: string
+          format: date-time
+
+    FeaturesResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: success
+        cache:
+          type: string
+          enum: [HIT, MISS]
+        data:
+          $ref: "#/components/schemas/FeaturesData"
+
+    PricingTier:
+      type: object
+      properties:
+        name:
+          type: string
+          description: Plan or tier name
+          example: Pro Plan
+        price:
+          type: string
+          description: Price string as found in G2 snippet (e.g. "$7.25/mo")
+          example: "$7.25/mo"
+
+    PricingData:
+      type: object
+      properties:
+        slug:
+          type: string
+          example: slack
+        pricing_tiers:
+          type: array
+          items:
+            $ref: "#/components/schemas/PricingTier"
+        has_free_plan:
+          type: boolean
+          example: true
+        has_free_trial:
+          type: boolean
+          example: true
+        raw_snippet:
+          type: string
+          description: Raw SERP snippet from the G2 pricing page (max 1000 chars)
+          example: "Slack pricing starts at $7.25/month..."
+        platform:
+          type: string
+          example: g2
+        scraped_at:
+          type: string
+          format: date-time
+
+    PricingResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: success
+        cache:
+          type: string
+          enum: [HIT, MISS]
+        data:
+          $ref: "#/components/schemas/PricingData"
+
+    AlternativeItem:
+      type: object
+      properties:
+        name:
+          type: string
+          example: Microsoft Teams
+        slug:
+          type: string
+          example: microsoft-teams
+        rating:
+          type: number
+          format: float
+          description: Rating (0.0 when not available from compare page SERP)
+          example: 0.0
+        profile_url:
+          type: string
+          format: uri
+          example: https://www.g2.com/products/microsoft-teams/reviews
+        compare_url:
+          type: string
+          format: uri
+          description: Direct G2 side-by-side comparison URL
+          example: https://www.g2.com/compare/slack-vs-microsoft-teams
+        platform:
+          type: string
+          example: g2
+
+    AlternativesData:
+      type: object
+      properties:
+        slug:
+          type: string
+          example: slack
+        returned:
+          type: integer
+          example: 5
+        platform:
+          type: string
+          example: g2
+        scraped_at:
+          type: string
+          format: date-time
+        alternatives:
+          type: array
+          items:
+            $ref: "#/components/schemas/AlternativeItem"
+
+    AlternativesResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: success
+        cache:
+          type: string
+          enum: [HIT, MISS]
+        data:
+          $ref: "#/components/schemas/AlternativesData"
+
+    ProductSummary:
+      type: object
+      description: Compact product entry used in search and category results
+      properties:
+        name:
+          type: string
+          example: Asana
+        slug:
+          type: string
+          example: asana
+        rating:
+          type: number
+          format: float
+          description: Rating extracted from SERP snippet (0.0 if not found)
+          example: 4.4
+        description:
+          type: string
+          example: "Asana is a project management tool that helps teams..."
+        profile_url:
+          type: string
+          format: uri
+          example: https://www.g2.com/products/asana/reviews
+        platform:
+          type: string
+          example: g2
+
+    SearchData:
+      type: object
+      properties:
+        query:
+          type: string
+          example: project management
+        category:
+          type: string
+          nullable: true
+          example: null
+        total_found:
+          type: integer
+          example: 10
+        platform:
+          type: string
+          example: g2
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/ProductSummary"
+
+    SearchResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: success
+        cache:
+          type: string
+          enum: [HIT, MISS]
+        data:
+          $ref: "#/components/schemas/SearchData"
+
+    CategoryData:
+      type: object
+      properties:
+        category_slug:
+          type: string
+          example: team-collaboration
+        category_url:
+          type: string
+          format: uri
+          example: https://www.g2.com/categories/team-collaboration
+        total_found:
+          type: integer
+          example: 10
+        platform:
+          type: string
+          example: g2
+        scraped_at:
+          type: string
+          format: date-time
+        products:
+          type: array
+          items:
+            $ref: "#/components/schemas/ProductSummary"
+
+    CategoryResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: success
+        cache:
+          type: string
+          enum: [HIT, MISS]
+        data:
+          $ref: "#/components/schemas/CategoryData"
