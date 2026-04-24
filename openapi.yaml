@@ -16,7 +16,7 @@ info:
     email: berkdivaroren@gmail.com
 
 servers:
-  - url: https://g2-scraping-api.up.railway.app
+  - url: https://web-production-e1c13.up.railway.app
     description: Production
 
 tags:
