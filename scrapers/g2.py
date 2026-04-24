@@ -465,8 +465,8 @@ def search_products(query: str, category: str = None, limit: int = 10) -> dict:
         seen = set()
         cat_str = f" {category}" if category else ""
 
-        # ── 1 SERP call — broad query returns more product pages ─────────────
-        data = _serp(f'g2.com best {query}{cat_str} software reviews')
+        # ── 1 SERP call — site:g2.com/products targets product pages directly ─
+        data = _serp(f'site:g2.com/products "{query}"{cat_str}')
         for r in _organic(data):
             if len(products) >= limit:
                 break
@@ -474,7 +474,8 @@ def search_products(query: str, category: str = None, limit: int = 10) -> dict:
             slug = _slug_from_url(url)
             if not slug or slug in seen:
                 continue
-            if not re.search(r'g2\.com/products/[^/]+/reviews', url):
+            # Accept any g2.com/products/{slug} URL (not just /reviews suffix)
+            if not re.search(r'g2\.com/products/[^/?#]+', url):
                 continue
             seen.add(slug)
             snippet = r.get("snippet", "")
@@ -511,14 +512,16 @@ def get_category(slug: str, limit: int = 10) -> dict:
         seen = set()
         category_words = _slug_to_words(slug)
 
-        # ── 1 SERP call ──────────────────────────────────────────────────────
-        data = _serp(f'g2.com best {category_words} software')
+        # ── 1 SERP call — site:g2.com/products scoped to category keywords ───
+        data = _serp(f'site:g2.com/products {category_words}')
         for r in _organic(data):
             if len(products) >= limit:
                 break
             url = r.get("link", "")
             prod_slug = _slug_from_url(url)
             if not prod_slug or prod_slug in seen:
+                continue
+            if not re.search(r'g2\.com/products/[^/?#]+', url):
                 continue
             seen.add(prod_slug)
             snippet = r.get("snippet", "")
