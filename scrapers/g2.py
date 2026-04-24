@@ -5,24 +5,23 @@ G2 Scraping API — data source map:
     name, ratingValue (0-10), reviewCount, bestRating, applicationCategory
 
   ScraperAPI structured SERP  (~12-15 credits/call)
+    product:      site:g2.com/products/{slug}/reviews "star"  → stars dist
     reviews:      site:g2.com/products/{slug}/reviews
-    features:     site:g2.com/products/{slug}/features
-    pricing:      site:g2.com/products/{slug}/pricing
-    alternatives: site:g2.com/compare "{slug}-vs"
-    search:       site:g2.com {query} software reviews
-    category:     site:g2.com/categories/{slug}
     review text:  "What do you like best about {name}" site:g2.com
+    features:     site:g2.com/products/{slug}/features
+    pricing:      g2.com {slug} pricing
+    alternatives: site:g2.com/compare "{slug}-vs"
+    search:       site:g2.com/products {query}
+    category:     g2.com best {category words} software
 """
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from urllib.parse import quote_plus
 
 import requests
 
 SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY")
-
-_UNAVAILABLE = {"status": "unavailable", "platform": "g2"}
 
 
 # ---------------------------------------------------------------------------
@@ -105,20 +104,36 @@ def _extract_review_count(texts: list) -> int:
 
 
 def _extract_stars_dist(texts: list) -> dict:
+    """
+    Matches G2 snippet patterns:
+      "5 star. 75% · 4 star. 20% · 3 star. 3% · 2 star. 1% · 1 star. 1%"
+      "5 stars. 75%"  /  "5-star: 75%"
+    """
+    # Widen the trigger check — accept both "5 star." and "5 stars."
+    trigger = re.compile(r'5\s*stars?\W{0,3}\s*\d+\s*%', re.I)
     for s in texts:
-        if re.search(r'5 stars?\.\s*\d+%', s, re.I):
-            dist = {}
-            for star in range(5, 0, -1):
-                m = re.search(rf'{star}\s+stars?\.\s*(\d+)%', s, re.I)
-                dist[str(star)] = _safe_int(m.group(1)) if m else 0
-            if any(v > 0 for v in dist.values()):
-                return dist
+        if not trigger.search(s):
+            continue
+        dist = {}
+        for star in range(5, 0, -1):
+            # Allow dot, colon, dash, space between "N star" and the percentage
+            m = re.search(
+                rf'{star}\s*stars?\W{{0,5}}\s*(\d+)\s*%',
+                s, re.I
+            )
+            dist[str(star)] = _safe_int(m.group(1)) if m else 0
+        if any(v > 0 for v in dist.values()):
+            return dist
     return {"5": 0, "4": 0, "3": 0, "2": 0, "1": 0}
 
 
 def _slug_from_url(url: str) -> str:
     m = re.search(r'g2\.com/products/([^/?#]+)', url)
     return m.group(1) if m else ""
+
+
+def _slug_to_words(slug: str) -> str:
+    return slug.replace("-", " ")
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +180,16 @@ def get_product(slug: str) -> dict:
         except Exception:
             pass
 
-        # Fallback SERP for description and stars_dist
+        # Dedicated SERP for stars_dist — query targets the reviews page with
+        # "star" keyword so Google returns the aggregate snippet
+        try:
+            dist_data = _serp(f'site:g2.com/products/{slug}/reviews "star" "%"')
+            dist_texts = _snippets(_organic(dist_data))
+            stars_dist = _extract_stars_dist(dist_texts)
+        except Exception:
+            pass
+
+        # Fallback general SERP for description, name, rating/count if needed
         try:
             data = _serp(f"site:g2.com {slug} reviews")
             results = _organic(data)
@@ -184,7 +208,9 @@ def get_product(slug: str) -> dict:
             if total_reviews == 0:
                 total_reviews = _extract_review_count(texts)
 
-            stars_dist = _extract_stars_dist(texts)
+            # stars_dist fallback from general SERP if dedicated query failed
+            if not any(v > 0 for v in stars_dist.values()):
+                stars_dist = _extract_stars_dist(texts)
 
             for r in results:
                 url = r.get("link", "")
@@ -271,7 +297,6 @@ def get_reviews(slug: str, limit: int = 20, rating: int = None, sort: str = "mos
                     if key in seen_texts:
                         continue
                     seen_texts.add(key)
-                    # Try to extract pros/cons from snippet
                     pros = ""
                     cons = ""
                     m_pro = re.search(r'(?:like best|Pros?)[:\s]+(.+?)(?:\n|What do you dislike|Cons?[:\s]|$)', snippet, re.I | re.S)
@@ -318,31 +343,64 @@ def get_reviews(slug: str, limit: int = 20, rating: int = None, sort: str = "mos
 
 
 def get_features(slug: str) -> dict:
+    """
+    G2 SERP snippets for features pages look like:
+      "Find out which X features {Name} supports, including Chat, Tags, ..."
+    We parse the token list after "including" and also try a broader query.
+    """
     try:
-        data = _serp(f"site:g2.com/products/{slug}/features")
-        results = _organic(data)
-
         features = []
         seen = set()
-        for r in results:
-            url = r.get("link", "")
-            if not re.search(r'g2\.com/products/[^/]+/features', url, re.I):
-                continue
-            snippet = r.get("snippet", "")
-            # Parse feature names from snippet — typically comma-separated or bullet-style
-            raw_features = re.split(r'[,·•\n]+', snippet)
-            for f in raw_features:
-                f = f.strip()
-                # Skip short noise or numeric-only tokens
-                if len(f) < 3 or re.match(r'^\d+$', f):
-                    continue
-                # Skip boilerplate
-                if re.search(r'G2|reviews|rating|verified|users', f, re.I):
-                    continue
-                key = f.lower()
-                if key not in seen:
-                    seen.add(key)
-                    features.append(f)
+
+        def _parse_features_from_snippet(snippet: str) -> list:
+            result = []
+            # Extract list after "including", "such as", "supports:", etc.
+            m = re.search(
+                r'(?:including|such as|supports?[:\s]+|features?[:\s]+)(.+?)(?:\.|$)',
+                snippet, re.I | re.S
+            )
+            if m:
+                raw = m.group(1)
+            else:
+                raw = snippet
+            # Split on commas, semicolons, bullets, newlines
+            parts = re.split(r'[,;·•\n]+', raw)
+            for p in parts:
+                p = p.strip().strip('.')
+                # Keep tokens that look like feature names:
+                # 2–60 chars, not pure numbers, not boilerplate
+                if 2 <= len(p) <= 60 and not re.match(r'^\d+$', p):
+                    if not re.search(
+                        r'\b(g2|reviews?|rating|verified|users?|find out|supports?|features?|'
+                        r'which|learn|explore|compare|get|see|read)\b',
+                        p, re.I
+                    ):
+                        result.append(p)
+            return result
+
+        def _add_features(snippets_list: list):
+            for s in snippets_list:
+                for f in _parse_features_from_snippet(s):
+                    key = f.lower()
+                    if key not in seen:
+                        seen.add(key)
+                        features.append(f)
+
+        # Query 1: direct features page
+        try:
+            data1 = _serp(f"site:g2.com/products/{slug}/features")
+            _add_features(_snippets(_organic(data1)))
+        except Exception:
+            pass
+
+        # Query 2: broader — product name + features + g2
+        if len(features) < 5:
+            try:
+                product_name = _slug_to_words(slug)
+                data2 = _serp(f'"{product_name}" features site:g2.com')
+                _add_features(_snippets(_organic(data2)))
+            except Exception:
+                pass
 
         return {
             "status": "success",
@@ -363,39 +421,103 @@ def get_features(slug: str) -> dict:
 
 
 def get_pricing(slug: str) -> dict:
+    """
+    Tries multiple SERP queries to find pricing info for a G2 product.
+    Parses free/paid indicators and price tier strings from snippets.
+    """
     try:
-        data = _serp(f"site:g2.com/products/{slug}/pricing")
-        results = _organic(data)
+        pricing_tiers = []
+        has_free_plan = False
+        has_free_trial = False
+        raw_snippet = ""
 
-        pricing_info = []
-        raw_text = ""
-        for r in results:
-            url = r.get("link", "")
-            if not re.search(r'g2\.com/products/[^/]+/pricing', url, re.I):
-                continue
-            snippet = r.get("snippet", "")
-            if snippet:
-                raw_text = snippet[:1000]
-                # Extract price tiers from snippet
-                tiers = re.findall(r'(\$[\d,]+(?:\.\d{2})?(?:/\w+)?)', snippet)
-                tier_names = re.findall(r'([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)\s+(?:Plan|Tier|Edition)', snippet)
-                for i, tier in enumerate(tiers):
-                    name = tier_names[i] if i < len(tier_names) else f"Tier {i+1}"
-                    pricing_info.append({"name": name, "price": tier})
-                break
+        def _parse_pricing(snippet: str):
+            nonlocal has_free_plan, has_free_trial, raw_snippet
+            if len(snippet) > len(raw_snippet):
+                raw_snippet = snippet[:1000]
 
-        # Check for free/freemium
-        is_free = bool(re.search(r'\bfree\b', raw_text, re.I)) if raw_text else False
-        has_trial = bool(re.search(r'free trial|trial', raw_text, re.I)) if raw_text else False
+            if re.search(r'\bfree\s*plan\b|\bfreemium\b|\bfree\s*tier\b', snippet, re.I):
+                has_free_plan = True
+            if re.search(r'free\s*trial|trial\s*available', snippet, re.I):
+                has_free_trial = True
+
+            # Price patterns: $7.25/mo, $12/user/month, $99/year, etc.
+            price_pattern = re.compile(
+                r'(\$[\d,]+(?:\.\d{1,2})?(?:[/ ]\w+)*)',
+                re.I
+            )
+            # Tier name candidates preceding a price or "Plan"/"Edition"
+            tier_name_pattern = re.compile(
+                r'\b([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)?)\s*(?:Plan|Edition|Tier)?'
+                r'\s*[:\-–]?\s*(\$[\d,]+(?:\.\d{1,2})?(?:[/ ]\w+)*)',
+                re.I
+            )
+
+            seen_prices = {t["price"] for t in pricing_tiers}
+
+            for m in tier_name_pattern.finditer(snippet):
+                name = m.group(1).strip()
+                price = m.group(2).strip()
+                if price not in seen_prices and not re.search(
+                    r'^(Find|See|Read|Get|Compare|Learn|The|This|That|With|For|From|All|Any)$',
+                    name, re.I
+                ):
+                    pricing_tiers.append({"name": name, "price": price})
+                    seen_prices.add(price)
+
+            # Fallback: standalone prices without tier names
+            if not pricing_tiers:
+                for m in price_pattern.finditer(snippet):
+                    price = m.group(1)
+                    if price not in seen_prices:
+                        pricing_tiers.append({"name": "Plan", "price": price})
+                        seen_prices.add(price)
+
+            # "Contact Sales" / "Custom pricing" → enterprise tier
+            if re.search(r'contact\s+sales|custom\s+pric|enterprise\s+pric', snippet, re.I):
+                if not any(t["name"].lower() == "enterprise" for t in pricing_tiers):
+                    pricing_tiers.append({"name": "Enterprise", "price": "Contact Sales"})
+
+        # Query 1: G2 product pricing page
+        try:
+            data1 = _serp(f"site:g2.com/products/{slug}/pricing")
+            for r in _organic(data1):
+                if re.search(r'g2\.com/products/[^/]+/pricing', r.get("link", ""), re.I):
+                    _parse_pricing(r.get("snippet", ""))
+        except Exception:
+            pass
+
+        # Query 2: broader — product name + pricing + g2
+        if not pricing_tiers and not raw_snippet:
+            try:
+                product_name = _slug_to_words(slug)
+                data2 = _serp(f'g2.com "{product_name}" pricing')
+                for r in _organic(data2):
+                    snippet = r.get("snippet", "")
+                    if snippet and re.search(r'g2\.com', r.get("link", ""), re.I):
+                        _parse_pricing(snippet)
+            except Exception:
+                pass
+
+        # Query 3: site:g2.com slug pricing
+        if not pricing_tiers and not raw_snippet:
+            try:
+                data3 = _serp(f'site:g2.com "{_slug_to_words(slug)}" pricing')
+                for r in _organic(data3):
+                    snippet = r.get("snippet", "")
+                    if snippet:
+                        _parse_pricing(snippet)
+            except Exception:
+                pass
 
         return {
             "status": "success",
             "data": {
                 "slug": slug,
-                "pricing_tiers": pricing_info,
-                "has_free_plan": is_free,
-                "has_free_trial": has_trial,
-                "raw_snippet": raw_text,
+                "pricing_tiers": pricing_tiers,
+                "has_free_plan": has_free_plan,
+                "has_free_trial": has_free_trial,
+                "raw_snippet": raw_snippet,
                 "platform": "g2",
                 "scraped_at": datetime.utcnow().isoformat()
             }
@@ -409,11 +531,15 @@ def get_pricing(slug: str) -> dict:
 
 
 def get_alternatives(slug: str, limit: int = 5) -> dict:
+    """
+    Fetches competitor slugs from G2 compare pages, then enriches each with
+    rating from rating_schema.json (0 credits, parallel HTTP).
+    """
     try:
         data = _serp(f'site:g2.com/compare "{slug}-vs"')
         results = _organic(data)
 
-        alternatives = []
+        alternatives_raw = []
         seen = {slug}
         for r in results:
             url = r.get("link", "")
@@ -430,23 +556,52 @@ def get_alternatives(slug: str, limit: int = 5) -> dict:
             seen.add(alt_slug)
             title = r.get("title", "")
             name = _extract_name(title) if title else alt_slug.replace("-", " ").title()
-            alternatives.append({
+            alternatives_raw.append({
                 "name": name,
                 "slug": alt_slug,
-                "rating": 0.0,
-                "profile_url": f"https://www.g2.com/products/{alt_slug}/reviews",
                 "compare_url": f"https://www.g2.com/compare/{slug}-vs-{alt_slug}",
-                "platform": "g2"
             })
-            if len(alternatives) >= limit:
+            if len(alternatives_raw) >= limit:
                 break
+
+        # Enrich with ratings from rating_schema.json (parallel, 0 credits)
+        def _fetch_alt_rating(item: dict) -> dict:
+            try:
+                schema = _fetch_rating_schema(item["slug"])
+                agg = schema.get("aggregateRating", {})
+                best = _safe_float(agg.get("bestRating", 10))
+                raw = _safe_float(agg.get("ratingValue", 0))
+                rating = round(raw / best * 5, 1) if best else 0.0
+                review_count = _safe_int(agg.get("reviewCount", 0))
+                item["rating"] = rating
+                item["total_reviews"] = review_count
+                item["name"] = schema.get("name") or item["name"]
+            except Exception:
+                item["rating"] = 0.0
+                item["total_reviews"] = 0
+            item["profile_url"] = f"https://www.g2.com/products/{item['slug']}/reviews"
+            item["platform"] = "g2"
+            return item
+
+        enriched = []
+        with ThreadPoolExecutor(max_workers=min(len(alternatives_raw), 5)) as pool:
+            futures = {pool.submit(_fetch_alt_rating, item): item for item in alternatives_raw}
+            for future in as_completed(futures):
+                try:
+                    enriched.append(future.result())
+                except Exception:
+                    enriched.append(futures[future])
+
+        # Re-sort to original order
+        slug_order = {item["slug"]: i for i, item in enumerate(alternatives_raw)}
+        enriched.sort(key=lambda x: slug_order.get(x["slug"], 99))
 
         return {
             "status": "success",
             "data": {
                 "slug": slug,
-                "alternatives": alternatives,
-                "returned": len(alternatives),
+                "alternatives": enriched,
+                "returned": len(enriched),
                 "platform": "g2",
                 "scraped_at": datetime.utcnow().isoformat()
             }
@@ -460,37 +615,62 @@ def get_alternatives(slug: str, limit: int = 5) -> dict:
 
 
 def search_products(query: str, category: str = None, limit: int = 10) -> dict:
+    """
+    Multiple SERP strategies to maximize product result count.
+    Primary: site:g2.com/products {query}
+    Fallback: g2.com {query} software reviews (broader, no strict site path)
+    """
     try:
-        q = f"site:g2.com {query} software reviews"
-        if category:
-            q = f"site:g2.com {query} {category} reviews"
-
-        data = _serp(q)
-        results = _organic(data)
-
         products = []
         seen = set()
-        for r in results:
-            url = r.get("link", "")
-            slug = _slug_from_url(url)
-            if not slug or slug in seen:
-                continue
-            if not re.search(r'g2\.com/products/[^/]+/reviews', url):
-                continue
-            seen.add(slug)
-            name = _extract_name(r.get("title", slug))
-            snippet = r.get("snippet", "")
-            rating = _extract_rating([snippet])
-            products.append({
-                "name": name,
-                "slug": slug,
-                "rating": rating,
-                "description": snippet[:300] if snippet else "",
-                "profile_url": f"https://www.g2.com/products/{slug}/reviews",
-                "platform": "g2"
-            })
-            if len(products) >= limit:
-                break
+
+        def _collect(results: list):
+            for r in results:
+                if len(products) >= limit:
+                    break
+                url = r.get("link", "")
+                slug = _slug_from_url(url)
+                if not slug or slug in seen:
+                    continue
+                if not re.search(r'g2\.com/products/[^/]+/reviews', url):
+                    continue
+                seen.add(slug)
+                name = _extract_name(r.get("title", slug))
+                snippet = r.get("snippet", "")
+                rating = _extract_rating([snippet])
+                products.append({
+                    "name": name,
+                    "slug": slug,
+                    "rating": rating,
+                    "description": snippet[:300] if snippet else "",
+                    "profile_url": f"https://www.g2.com/products/{slug}/reviews",
+                    "platform": "g2"
+                })
+
+        cat_str = f" {category}" if category else ""
+
+        # Query 1: target /products/ path directly
+        try:
+            data1 = _serp(f'site:g2.com/products "{query}"{cat_str}')
+            _collect(_organic(data1))
+        except Exception:
+            pass
+
+        # Query 2: broader g2 search without strict path
+        if len(products) < limit:
+            try:
+                data2 = _serp(f'site:g2.com {query}{cat_str} software reviews')
+                _collect(_organic(data2))
+            except Exception:
+                pass
+
+        # Query 3: even broader — no site: filter, but require g2.com in results
+        if len(products) < limit:
+            try:
+                data3 = _serp(f'g2.com best {query}{cat_str} software')
+                _collect(_organic(data3))
+            except Exception:
+                pass
 
         return {
             "status": "success",
@@ -511,31 +691,59 @@ def search_products(query: str, category: str = None, limit: int = 10) -> dict:
 
 
 def get_category(slug: str, limit: int = 10) -> dict:
+    """
+    G2 category pages don't appear well in SERPs via site:g2.com/categories/.
+    Instead use broader queries that surface product review pages belonging to
+    the category.
+    """
     try:
-        data = _serp(f"site:g2.com/categories/{slug}")
-        results = _organic(data)
-
         products = []
         seen = set()
-        for r in results:
-            url = r.get("link", "")
-            prod_slug = _slug_from_url(url)
-            if not prod_slug or prod_slug in seen:
-                continue
-            seen.add(prod_slug)
-            name = _extract_name(r.get("title", prod_slug))
-            snippet = r.get("snippet", "")
-            rating = _extract_rating([snippet])
-            products.append({
-                "name": name,
-                "slug": prod_slug,
-                "rating": rating,
-                "description": snippet[:300] if snippet else "",
-                "profile_url": f"https://www.g2.com/products/{prod_slug}/reviews",
-                "platform": "g2"
-            })
-            if len(products) >= limit:
-                break
+        category_words = _slug_to_words(slug)
+
+        def _collect(results: list):
+            for r in results:
+                if len(products) >= limit:
+                    break
+                url = r.get("link", "")
+                prod_slug = _slug_from_url(url)
+                if not prod_slug or prod_slug in seen:
+                    continue
+                seen.add(prod_slug)
+                name = _extract_name(r.get("title", prod_slug))
+                snippet = r.get("snippet", "")
+                rating = _extract_rating([snippet])
+                products.append({
+                    "name": name,
+                    "slug": prod_slug,
+                    "rating": rating,
+                    "description": snippet[:300] if snippet else "",
+                    "profile_url": f"https://www.g2.com/products/{prod_slug}/reviews",
+                    "platform": "g2"
+                })
+
+        # Query 1: g2 best X software (most reliable for category browsing)
+        try:
+            data1 = _serp(f'g2.com best {category_words} software')
+            _collect(_organic(data1))
+        except Exception:
+            pass
+
+        # Query 2: site:g2.com/products with category words
+        if len(products) < limit:
+            try:
+                data2 = _serp(f'site:g2.com/products {category_words}')
+                _collect(_organic(data2))
+            except Exception:
+                pass
+
+        # Query 3: direct category page
+        if len(products) < limit:
+            try:
+                data3 = _serp(f'site:g2.com/categories/{slug}')
+                _collect(_organic(data3))
+            except Exception:
+                pass
 
         return {
             "status": "success",
