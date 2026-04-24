@@ -37,10 +37,6 @@ tags:
   - name: Health
     description: API health check
 
-security:
-  - RapidApiKey: []
-    RapidApiHost: []
-
 paths:
 
   /health:
@@ -48,7 +44,6 @@ paths:
       tags: [Health]
       summary: Health check
       description: Returns API status and version. No authentication required.
-      security: []
       operationId: getHealth
       responses:
         "200":
@@ -474,18 +469,6 @@ paths:
           $ref: "#/components/responses/ScraperError"
 
 components:
-
-  securitySchemes:
-    RapidApiKey:
-      type: apiKey
-      in: header
-      name: X-RapidAPI-Key
-      description: Your RapidAPI key
-    RapidApiHost:
-      type: apiKey
-      in: header
-      name: X-RapidAPI-Host
-      description: API host identifier provided by RapidAPI
 
   parameters:
     slug:
