@@ -12,15 +12,15 @@ Per-endpoint SERP call budget (each call ~8-12s):
 """
 import os
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import requests
 
 SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY")
 
-_SERP_TIMEOUT = 25   # fail fast — gateway kills at 30s
-_SCHEMA_TIMEOUT = 8  # rating_schema.json is tiny
+_SERP_TIMEOUT = 25    # requests.get hard cap — gateway kills at 30s
+_SCHEMA_TIMEOUT = 8   # rating_schema.json is tiny
+_SCRAPERAPI_TIMEOUT = 20  # ScraperAPI server-side cut-off (returns partial on timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -30,7 +30,13 @@ _SCHEMA_TIMEOUT = 8  # rating_schema.json is tiny
 def _serp(query: str) -> dict:
     resp = requests.get(
         "https://api.scraperapi.com/structured/google/search",
-        params={"api_key": SCRAPERAPI_KEY, "query": query},
+        params={
+            "api_key": SCRAPERAPI_KEY,
+            "query": query,
+            "timeout": _SCRAPERAPI_TIMEOUT,  # server-side; ScraperAPI returns before our hard cap
+            "render": "false",               # no JS rendering — 2-3x faster
+            "country_code": "us",            # consistent datacenter routing
+        },
         timeout=_SERP_TIMEOUT,
     )
     resp.raise_for_status()
@@ -423,35 +429,17 @@ def get_alternatives(slug: str, limit: int = 5) -> dict:
             if len(alternatives_raw) >= limit:
                 break
 
-        # ── Parallel rating_schema.json (~1-2s total, 0 credits) ────────────
-        def _enrich(item: dict) -> dict:
-            try:
-                schema = _fetch_rating_schema(item["slug"])
-                agg = schema.get("aggregateRating", {})
-                best = _safe_float(agg.get("bestRating", 10))
-                raw = _safe_float(agg.get("ratingValue", 0))
-                item["rating"] = round(raw / best * 5, 1) if best else 0.0
-                item["total_reviews"] = _safe_int(agg.get("reviewCount", 0))
-                item["name"] = schema.get("name") or item["name"]
-            except Exception:
-                item["rating"] = 0.0
-                item["total_reviews"] = 0
-            item["profile_url"] = f"https://www.g2.com/products/{item['slug']}/reviews"
-            item["platform"] = "g2"
-            return item
-
-        enriched = list(alternatives_raw)  # keep order
-        if enriched:
-            with ThreadPoolExecutor(max_workers=min(len(enriched), 5)) as pool:
-                futures = {pool.submit(_enrich, item): i for i, item in enumerate(enriched)}
-                result_map = {}
-                for future in as_completed(futures):
-                    idx = futures[future]
-                    try:
-                        result_map[idx] = future.result()
-                    except Exception:
-                        result_map[idx] = enriched[idx]
-            enriched = [result_map[i] for i in range(len(enriched))]
+        # ── Build final list — no extra HTTP calls ───────────────────────────
+        enriched = []
+        for item in alternatives_raw:
+            enriched.append({
+                "name": item["name"],
+                "slug": item["slug"],
+                "rating": 0.0,
+                "profile_url": f"https://www.g2.com/products/{item['slug']}/reviews",
+                "compare_url": item["compare_url"],
+                "platform": "g2",
+            })
 
         return {
             "status": "success",
