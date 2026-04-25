@@ -183,6 +183,21 @@ def _stars_dist_from_page(soup):
 # Review card parser
 # ---------------------------------------------------------------------------
 
+def _split_review_text(text):
+    """Split G2 review body into pros/cons using G2's fixed question labels."""
+    pros, cons = "", ""
+    m_like     = re.search(r'What do you like best[^?]*\?', text, re.I)
+    m_dislike  = re.search(r'What do you (?:not like|dislike)[^?]*\?', text, re.I)
+    m_problems = re.search(r'(?:What problems|Recommendations)[^?]*\?', text, re.I)
+    if m_like:
+        end  = m_dislike.start() if m_dislike else (m_problems.start() if m_problems else len(text))
+        pros = text[m_like.end():end].strip()
+    if m_dislike:
+        end  = m_problems.start() if m_problems else len(text)
+        cons = text[m_dislike.end():end].strip()
+    return pros[:500], cons[:500]
+
+
 def _parse_review_card(card, index):
     # Rating — G2 uses aria-label="X out of 5" on the star container
     rating_val = 0
@@ -210,42 +225,49 @@ def _parse_review_card(card, index):
         span = author_el.find("span", class_=re.compile(r'fw-semibold', re.I)) or author_el
         author = _text(span)[:100] or "Anonymous"
 
-    # Author title / job
+    # Author title / job — G2 shows "Job Title at Company" near the reviewer
     author_title = ""
-    for el in card.find_all(class_=re.compile(r'reviewer-title|job-title|l-text-muted|small', re.I)):
+    for el in card.find_all(["div", "span"]):
         t = _text(el)
-        if t and len(t) < 100 and t != author:
-            author_title = t[:100]
+        if (5 < len(t) < 120 and t != author and
+                not re.search(r'\d{4}|verified|review|g2\.com', t, re.I) and
+                (re.search(r'\bat\b', t) or
+                 re.search(r'mt-4th|text-small|muted|midnight',
+                            " ".join(el.get("class") or []), re.I))):
+            author_title = t[:120]
             break
 
-    # Date
+    # Date — try <time>, then any [datetime] attr, then text pattern
     date = ""
     date_el = card.find("time")
     if date_el:
         date = date_el.get("datetime", "") or _text(date_el)
-
-    # Pros / Cons — G2 uses <strong> labels inside <p> before the answer <p>
-    pros = ""
-    cons = ""
-    for strong in card.find_all("strong"):
-        label = _text(strong).lower()
-        parent_p = strong.find_parent("p")
-        if not parent_p:
-            continue
-        answer_p = parent_p.find_next_sibling("p")
-        if not answer_p:
-            continue
-        answer = _text(answer_p)
-        if not answer:
-            continue
-        if "like best" in label or ("like" in label and "what do you" in label):
-            pros = answer[:500]
-        elif "dislike" in label or "least" in label or ("don't like" in label):
-            cons = answer[:500]
+    if not date:
+        dt_el = card.find(attrs={"datetime": True})
+        if dt_el:
+            date = dt_el["datetime"]
+    if not date:
+        m = re.search(
+            r'\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4}\b',
+            _text(card), re.I,
+        )
+        if m:
+            date = m.group(0)
 
     # Full review body
     body_el = card.find(attrs={"itemprop": "reviewBody"})
-    text = _text(body_el)[:2000] if body_el else (f"{pros} {cons}".strip())[:2000]
+    text = _text(body_el)[:2000] if body_el else ""
+
+    # Pros / Cons — primary: aria-label sections; fallback: regex-split text
+    pros_el = card.find(attrs={"aria-label": re.compile(r'^pros?$', re.I)})
+    cons_el = card.find(attrs={"aria-label": re.compile(r'^cons?$', re.I)})
+    pros = _text(pros_el)[:500] if pros_el else ""
+    cons = _text(cons_el)[:500] if cons_el else ""
+    if not pros and not cons and text:
+        pros, cons = _split_review_text(text)
+
+    if not text:
+        text = f"{pros} {cons}".strip()[:2000]
 
     if not text and not title:
         return None
@@ -260,7 +282,7 @@ def _parse_review_card(card, index):
         "date": date,
         "author": author,
         "author_title": author_title,
-        "verified": bool(card.find(string=re.compile(r'\bverified\b', re.I))),
+        "verified": bool(card.find(string=re.compile(r'Verified\s+(?:Current\s+)?User', re.I))),
         "helpful_votes": 0,
         "platform": "g2",
     }
