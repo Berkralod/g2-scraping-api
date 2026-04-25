@@ -330,26 +330,19 @@ def get_product(slug: str) -> dict:
             stars_dist = _stars_dist_from_page(soup)
 
             if not description:
-                for sel in [
-                    {"property": "og:description"},
-                    {"name": "description"},
-                    {"name": "twitter:description"},
-                ]:
-                    m = soup.find("meta", sel)
-                    if m and m.get("content", "").strip():
-                        description = m["content"].strip()[:500]
-                        break
-            if not description:
+                # itemprop="description" div is the real product description
                 desc_el = soup.find(attrs={"itemprop": "description"})
-                if desc_el:
+                if desc_el and desc_el.name != "meta":
                     description = _text(desc_el)[:500]
             if not description:
-                # First substantial paragraph not inside a review card
-                for p in soup.find_all("p"):
-                    t = _text(p)
-                    if len(t) > 80 and not p.find_parent(attrs={"itemprop": "review"}):
-                        description = t[:500]
-                        break
+                # meta og:description often says "Filter X reviews..." — skip
+                for sel in [{"name": "description"}, {"name": "twitter:description"}]:
+                    m = soup.find("meta", sel)
+                    if m and m.get("content", "").strip():
+                        cand = m["content"].strip()
+                        if not re.search(r'Filter\s+[\d,]+\s+reviews', cand, re.I):
+                            description = cand[:500]
+                            break
 
             if not categories:
                 for a in soup.find_all("a", href=re.compile(r'/categories/')):
@@ -437,33 +430,38 @@ def get_features(slug: str) -> dict:
 
         soup = _fetch_page(f"https://www.g2.com/products/{slug}/features")
 
-        # Strategy 1: elements with class containing "feature"
-        for el in soup.find_all(class_=re.compile(r'\bfeature\b', re.I)):
-            name = _text(el)
-            if (2 <= len(name) <= 80 and
-                    name.lower() not in seen and
-                    not re.search(r'reviews?|g2|rating|compare|learn|see all', name, re.I)):
-                seen.add(name.lower())
-                features.append(name)
+        # Strategy 1: combobox JSON in data attribute — most reliable source
+        # G2 embeds the full feature list as JSON in the filter combobox
+        combobox = soup.find(attrs={"data-elv--form--combobox-controller-choices-value": True})
+        if combobox:
+            raw = combobox.get("data-elv--form--combobox-controller-choices-value", "")
+            raw = raw.replace("&quot;", '"')
+            try:
+                items = json.loads(raw)
+                for item in items:
+                    label = item.get("label", "").strip()
+                    if label and label.lower() not in seen and 2 <= len(label) <= 80:
+                        seen.add(label.lower())
+                        features.append(label)
+            except Exception:
+                pass
 
-        # Strategy 2: table cells (G2 features page uses a scoring table)
+        # Strategy 2: grid-item elements with feature names
         if not features:
-            for td in soup.find_all("td"):
-                name = _text(td)
+            for el in soup.find_all(class_=re.compile(r'grid-item', re.I)):
+                name = _text(el)
                 if (3 <= len(name) <= 70 and
                         name.lower() not in seen and
-                        not re.search(r'\d+%|\$|\bvs\b|g2|review|rating|compare', name, re.I)):
+                        not re.search(r'\d+%|\$|g2|review|rating|compare|learn|sign', name, re.I)):
                     seen.add(name.lower())
                     features.append(name)
 
-        # Strategy 3: list items in main content area
+        # Strategy 3: table cells
         if not features:
-            main = soup.find("main") or soup.find("article") or soup
-            for li in main.find_all("li"):
-                name = _text(li)
-                if (3 <= len(name) <= 70 and
-                        name.lower() not in seen and
-                        not re.search(r'reviews?|pricing|login|sign', name, re.I)):
+            for td in soup.find_all("td"):
+                name = _text(td)
+                if (3 <= len(name) <= 70 and name.lower() not in seen and
+                        not re.search(r'\d+%|\$|\bvs\b|g2|review|rating|compare', name, re.I)):
                     seen.add(name.lower())
                     features.append(name)
 
@@ -495,39 +493,38 @@ def get_pricing(slug: str) -> dict:
         soup = _fetch_page(f"https://www.g2.com/products/{slug}/pricing")
         page_text = soup.get_text()
 
-        if re.search(r'\bfree\s*plan\b|\bfreemium\b|\bfree\s*tier\b', page_text, re.I):
+        if re.search(r'\bfree\s*plan\b|\bfreemium\b|\bfree\s*tier\b|\$0\.00', page_text, re.I):
             has_free_plan = True
         if re.search(r'free\s*trial|trial\s*available', page_text, re.I):
             has_free_trial = True
 
-        # Strategy 1: structured pricing cards
-        for card in soup.find_all(class_=re.compile(r'pricing.*card|price.*plan|tier.*card|plan.*card', re.I)):
-            tier_name_el = card.find(["h2", "h3", "h4", "strong"])
-            price_el = card.find(class_=re.compile(r'\bprice\b', re.I))
-            if tier_name_el:
-                tier_name = _text(tier_name_el)[:60]
-                price = _text(price_el)[:60] if price_el else "Contact Sales"
-                if tier_name and tier_name.lower() not in seen_prices:
-                    pricing_tiers.append({"name": tier_name, "price": price})
-                    seen_prices.add(tier_name.lower())
+        # G2 pricing page uses elv-font-semibold for plan names and
+        # elv-text-xl + elv-font-bold for prices ($X.XX format)
+        html = str(soup)
+        names = re.findall(r'elv-font-semibold[^>]+>\s*([A-Z][A-Za-z][^<\n]{0,40}?)\s*</div>', html)
+        prices = re.findall(r'elv-text-xl[^"]*elv-font-bold[^>]+>\s*(\$[\d.]+)\s*<', html)
 
-        # Strategy 2: regex extraction from page text
-        if not pricing_tiers:
-            for m in re.finditer(
-                r'\b([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)?)\s*(?:Plan|Edition|Tier)?\s*[:\-\u2013]\s*'
-                r'(\$[\d,]+(?:\.\d{1,2})?(?:[/ ]\w+)*)',
-                page_text,
-            ):
-                name_t, price_t = m.group(1).strip(), m.group(2).strip()
-                if price_t not in seen_prices and not re.match(
-                    r'^(Find|See|Read|Get|Compare|Learn|The|This|With|For|From|All)$',
-                    name_t, re.I,
-                ):
-                    pricing_tiers.append({"name": name_t, "price": price_t})
-                    seen_prices.add(price_t)
+        # Clean plan names: exclude noise words and keep only meaningful tier names
+        plan_names = []
+        seen_names = set()
+        for n in names:
+            n = n.strip()
+            if (2 <= len(n) <= 40 and n.lower() not in seen_names and
+                    not re.search(r'trial|deal|offer|savings|exclusive|limited|claim|website|'
+                                  r'contact|filter|compare|review|feature|integrat', n, re.I)):
+                seen_names.add(n.lower())
+                plan_names.append(n)
 
+        # Zip names with prices; extras get "Contact Sales"
+        for i, plan_name in enumerate(plan_names):
+            price = prices[i] if i < len(prices) else "Contact Sales"
+            if plan_name.lower() not in seen_prices:
+                pricing_tiers.append({"name": plan_name, "price": price})
+                seen_prices.add(plan_name.lower())
+
+        # Ensure Enterprise tier appears if mentioned
         if re.search(r'contact\s+sales|custom\s+pric|enterprise\s+pric', page_text, re.I):
-            if not any(t["name"].lower() == "enterprise" for t in pricing_tiers):
+            if not any(re.search(r'enterprise', t["name"], re.I) for t in pricing_tiers):
                 pricing_tiers.append({"name": "Enterprise", "price": "Contact Sales"})
 
         return {
@@ -554,10 +551,14 @@ def get_alternatives(slug: str, limit: int = 5) -> dict:
         alternatives = []
         seen = {slug}
 
-        soup = _fetch_page(f"https://www.g2.com/products/{slug}/competitors/highest_rated")
+        # Correct URL: /competitors/alternatives (not /competitors/highest_rated)
+        soup = _fetch_page(f"https://www.g2.com/products/{slug}/competitors/alternatives")
 
-        # Find competitor product links with names
-        for a in soup.find_all("a", href=re.compile(r'/products/[^/?#]+(?:/reviews)?')):
+        # Each competitor card has:
+        # - elv-font-bold div with product name
+        # - label with "X.X/5" rating pattern after star SVGs
+        # Find all product review links; walk to card container for name + rating
+        for a in soup.find_all("a", href=re.compile(r'/products/[^/?#]+/reviews$')):
             if len(alternatives) >= limit:
                 break
             href = a.get("href", "")
@@ -566,23 +567,33 @@ def get_alternatives(slug: str, limit: int = 5) -> dict:
                 continue
             seen.add(alt_slug)
 
-            name = _text(a)[:100] or alt_slug.replace("-", " ").title()
-
-            # Walk up to card container to find rating
-            alt_rating = 0.0
-            card = a
-            for _ in range(5):
-                card = card.parent
-                if not card:
+            # Walk up to card container (stop at a reasonable ancestor)
+            card = a.parent
+            for _ in range(6):
+                if not card or not card.parent:
                     break
-                stars_el = card.find(attrs={"aria-label": re.compile(r'[\d.]+ out of 5', re.I)})
-                if stars_el:
-                    m = re.search(r'([\d.]+)\s+out of\s+5', stars_el.get("aria-label", ""), re.I)
+                card = card.parent
+
+            # Product name — elv-font-bold div inside the card (near the link)
+            name = ""
+            name_el = a.find(class_=re.compile(r'elv-font-bold', re.I))
+            if not name_el and card:
+                name_el = card.find(class_=re.compile(r'elv-font-bold', re.I))
+            if name_el:
+                name = _text(name_el)[:100]
+            name = name or _text(a)[:100] or alt_slug.replace("-", " ").title()
+
+            # Rating — "X.X/5" label that appears after the star SVGs
+            alt_rating = 0.0
+            if card:
+                for lbl in card.find_all(["label", "span", "div"]):
+                    t = _text(lbl)
+                    m = re.match(r'^([\d.]+)/5$', t.strip())
                     if m:
                         v = _safe_float(m.group(1))
                         if 0 < v <= 5:
                             alt_rating = round(v, 1)
-                    break
+                        break
 
             alternatives.append({
                 "name": name,
@@ -622,43 +633,44 @@ def search_products(query: str, category: str = None, limit: int = 10) -> dict:
 
         soup = _fetch_page(url)
 
-        for a in soup.find_all("a", href=re.compile(r'/products/[^/?#]+')):
+        # G2 search results use quadrant grid (Leader, High Performer, etc.)
+        # Individual ratings aren't in static HTML — collect unique slugs + names
+        for a in soup.find_all("a", href=re.compile(r'/products/[^/?#]+/reviews')):
             if len(products) >= limit:
                 break
             href = a.get("href", "")
             slug = _slug_from_url(href)
-            if not slug or slug in seen:
+            if not slug or slug in seen or "url_slug" in slug:
                 continue
             seen.add(slug)
 
-            name = _text(a)[:100] or slug.replace("-", " ").title()
+            name = _text(a).strip()[:100] or slug.replace("-", " ").title()
+            if not name or len(name) < 2:
+                name = slug.replace("-", " ").title()
 
-            # Walk to card for rating + description
+            # Try to find X.X/5 rating label near this link (new elv-* design cards)
             alt_rating = 0.0
-            desc = ""
-            card = a
-            for _ in range(5):
-                card = card.parent
+            card = a.parent
+            for _ in range(6):
                 if not card:
                     break
-                stars_el = card.find(attrs={"aria-label": re.compile(r'[\d.]+ out of 5', re.I)})
-                if stars_el:
-                    m = re.search(r'([\d.]+)\s+out of\s+5', stars_el.get("aria-label", ""), re.I)
+                for lbl in card.find_all(["label", "span"]):
+                    t = _text(lbl)
+                    m = re.match(r'^([\d.]+)/5$', t.strip())
                     if m:
                         v = _safe_float(m.group(1))
                         if 0 < v <= 5:
                             alt_rating = round(v, 1)
-                p = card.find("p")
-                if p:
-                    desc = _text(p)[:300]
-                if alt_rating or desc:
+                        break
+                if alt_rating:
                     break
+                card = card.parent
 
             products.append({
                 "name": name,
                 "slug": slug,
                 "rating": alt_rating,
-                "description": desc,
+                "description": "",
                 "profile_url": f"https://www.g2.com/products/{slug}/reviews",
                 "platform": "g2",
             })
@@ -688,42 +700,42 @@ def get_category(slug: str, limit: int = 10) -> dict:
 
         soup = _fetch_page(f"https://www.g2.com/categories/{slug}")
 
-        for a in soup.find_all("a", href=re.compile(r'/products/[^/?#]+')):
+        for a in soup.find_all("a", href=re.compile(r'/products/[^/?#]+/reviews')):
             if len(products) >= limit:
                 break
             href = a.get("href", "")
             prod_slug = _slug_from_url(href)
-            if not prod_slug or prod_slug in seen:
+            if not prod_slug or prod_slug in seen or "url_slug" in prod_slug:
                 continue
             seen.add(prod_slug)
 
-            name = _text(a)[:100] or prod_slug.replace("-", " ").title()
+            name = _text(a).strip()[:100] or prod_slug.replace("-", " ").title()
+            if not name or len(name) < 2:
+                name = prod_slug.replace("-", " ").title()
 
+            # Try X.X/5 label near this link (elv-* card design)
             alt_rating = 0.0
-            desc = ""
-            card = a
-            for _ in range(5):
-                card = card.parent
+            card = a.parent
+            for _ in range(6):
                 if not card:
                     break
-                stars_el = card.find(attrs={"aria-label": re.compile(r'[\d.]+ out of 5', re.I)})
-                if stars_el:
-                    m = re.search(r'([\d.]+)\s+out of\s+5', stars_el.get("aria-label", ""), re.I)
+                for lbl in card.find_all(["label", "span"]):
+                    t = _text(lbl)
+                    m = re.match(r'^([\d.]+)/5$', t.strip())
                     if m:
                         v = _safe_float(m.group(1))
                         if 0 < v <= 5:
                             alt_rating = round(v, 1)
-                p = card.find("p")
-                if p:
-                    desc = _text(p)[:300]
-                if alt_rating or desc:
+                        break
+                if alt_rating:
                     break
+                card = card.parent
 
             products.append({
                 "name": name,
                 "slug": prod_slug,
                 "rating": alt_rating,
-                "description": desc,
+                "description": "",
                 "profile_url": f"https://www.g2.com/products/{prod_slug}/reviews",
                 "platform": "g2",
             })
