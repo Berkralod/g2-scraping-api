@@ -22,7 +22,7 @@ from bs4 import BeautifulSoup
 BRIGHTDATA_API_KEY = os.getenv("BRIGHTDATA_API_KEY")
 BRIGHTDATA_ZONE = os.getenv("BRIGHTDATA_ZONE", "web_unlocker1")
 
-_BD_TIMEOUT = 25       # hard cap — gateway kills at 30s
+_BD_TIMEOUT = 90       # hard cap — BD needs up to 60s on heavy pages; gateway is now 120s
 _SCHEMA_TIMEOUT = 8    # rating_schema.json is tiny
 
 
@@ -141,8 +141,9 @@ def _review_count_from_page(soup):
 
 def _stars_dist_from_page(soup):
     dist = {"5": 0, "4": 0, "3": 0, "2": 0, "1": 0}
+    html = str(soup)
 
-    # Strategy 1: aria-label="X stars: Y%" or "X star: Y%"
+    # Strategy 1: aria-label="X stars: Y%" on any element
     for el in soup.find_all(attrs={"aria-label": True}):
         label = el.get("aria-label", "")
         m = re.match(r'(\d)\s*stars?\s*[:\-]\s*(\d+)\s*%', label, re.I)
@@ -151,25 +152,29 @@ def _stars_dist_from_page(soup):
     if any(v > 0 for v in dist.values()):
         return dist
 
-    # Strategy 2: data-score attribute with percentage child
-    for el in soup.find_all(attrs={"data-score": True}):
-        score = el.get("data-score", "")
-        pct_text = _text(el)
-        m = re.search(r'(\d+)\s*%', pct_text)
-        if m and score.isdigit() and 1 <= int(score) <= 5:
-            dist[score] = _safe_int(m.group(1))
+    # Strategy 2: raw HTML scan — picks up any inline "5 star … 62%" text regardless of markup
+    # Handles patterns like: "5 stars</div><div>62%", "5 star: 62%", "62% 5 stars"
+    for star in range(5, 0, -1):
+        patterns = [
+            rf'{star}\s*stars?[^<]{{0,60}}?(\d{{1,3}})\s*%',
+            rf'(\d{{1,3}})\s*%[^<]{{0,60}}?{star}\s*stars?',
+            rf'"{star}\s*stars?"[^>]*?>(\d{{1,3}})',
+        ]
+        for pat in patterns:
+            m = re.search(pat, html, re.I)
+            if m:
+                dist[str(star)] = _safe_int(m.group(1))
+                break
+
     if any(v > 0 for v in dist.values()):
         return dist
 
-    # Strategy 3: text scan for "5 stars 60%" patterns
-    page_text = str(soup)
-    for star in range(5, 0, -1):
-        m = re.search(
-            rf'{star}\s*stars?\s+(\d+)\s*%|(\d+)\s*%\s*{star}\s*stars?',
-            page_text, re.I,
-        )
-        if m:
-            dist[str(star)] = _safe_int(m.group(1) or m.group(2))
+    # Strategy 3: data-score attribute
+    for el in soup.find_all(attrs={"data-score": True}):
+        score = el.get("data-score", "")
+        m = re.search(r'(\d+)\s*%', _text(el))
+        if m and score.isdigit() and 1 <= int(score) <= 5:
+            dist[score] = _safe_int(m.group(1))
 
     return dist
 
@@ -308,13 +313,26 @@ def get_product(slug: str) -> dict:
             stars_dist = _stars_dist_from_page(soup)
 
             if not description:
-                desc_meta = soup.find("meta", {"name": "description"})
-                if desc_meta:
-                    description = desc_meta.get("content", "")[:500]
-                else:
-                    desc_el = soup.find(attrs={"itemprop": "description"})
-                    if desc_el:
-                        description = _text(desc_el)[:500]
+                for sel in [
+                    {"property": "og:description"},
+                    {"name": "description"},
+                    {"name": "twitter:description"},
+                ]:
+                    m = soup.find("meta", sel)
+                    if m and m.get("content", "").strip():
+                        description = m["content"].strip()[:500]
+                        break
+            if not description:
+                desc_el = soup.find(attrs={"itemprop": "description"})
+                if desc_el:
+                    description = _text(desc_el)[:500]
+            if not description:
+                # First substantial paragraph not inside a review card
+                for p in soup.find_all("p"):
+                    t = _text(p)
+                    if len(t) > 80 and not p.find_parent(attrs={"itemprop": "review"}):
+                        description = t[:500]
+                        break
 
             if not categories:
                 for a in soup.find_all("a", href=re.compile(r'/categories/')):
