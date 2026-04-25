@@ -199,70 +199,62 @@ def _split_review_text(text):
 
 
 def _parse_review_card(card, index):
-    # Rating — G2 uses aria-label="X out of 5" on the star container
+    # Rating — meta[itemprop="ratingValue"] is on 0-5 scale for individual reviews
     rating_val = 0
-    stars_el = card.find(attrs={"aria-label": re.compile(r'[\d.]+ out of 5', re.I)})
-    if stars_el:
-        m = re.search(r'([\d.]+)\s+out of\s+5', stars_el.get("aria-label", ""), re.I)
-        if m:
-            rating_val = round(_safe_float(m.group(1)))
-    if not rating_val:
-        rating_meta = card.find("meta", {"itemprop": "ratingValue"})
-        if rating_meta:
-            rating_val = round(_safe_float(rating_meta.get("content", 0)))
+    rating_meta = card.find("meta", {"itemprop": "ratingValue"})
+    if rating_meta:
+        rating_val = int(_safe_float(rating_meta.get("content", 0)) + 0.5)
 
-    # Title
-    title_el = card.find(attrs={"itemprop": "name"}) or card.find("h3")
-    title = _text(title_el)[:200] if title_el else ""
+    # Title — div[itemprop="name"], NOT the meta tag inside itemprop="author"
+    title = ""
+    title_el = card.find("div", attrs={"itemprop": "name"})
+    if title_el:
+        title = _text(title_el)[:200]
 
-    # Author — G2 uses fw-semibold span inside a user link
+    # Author — meta[itemprop="name"] inside itemprop="author" div
     author = "Anonymous"
-    author_el = (
-        card.find(attrs={"itemprop": "author"}) or
-        card.find("a", href=re.compile(r'/users/'))
-    )
-    if author_el:
-        span = author_el.find("span", class_=re.compile(r'fw-semibold', re.I)) or author_el
-        author = _text(span)[:100] or "Anonymous"
+    author_div = card.find(attrs={"itemprop": "author"})
+    if author_div:
+        name_meta = author_div.find("meta", {"itemprop": "name"})
+        author = name_meta.get("content", "").strip()[:100] if name_meta else _text(author_div)[:100]
+        author = author or "Anonymous"
 
-    # Author title / job — G2 shows "Job Title at Company" near the reviewer
+    # Author title — first elv-text-subtle sibling right after itemprop="author" div
+    # G2 structure: author_div → [job title] → [sector] → [company size] all as siblings
     author_title = ""
-    for el in card.find_all(["div", "span"]):
-        t = _text(el)
-        if (5 < len(t) < 120 and t != author and
-                not re.search(r'\d{4}|verified|review|g2\.com', t, re.I) and
-                (re.search(r'\bat\b', t) or
-                 re.search(r'mt-4th|text-small|muted|midnight',
-                            " ".join(el.get("class") or []), re.I))):
-            author_title = t[:120]
-            break
+    if author_div:
+        sib = author_div.find_next_sibling()
+        if sib and "elv-text-subtle" in " ".join(sib.get("class") or []):
+            author_title = _text(sib)[:120]
 
-    # Date — try <time>, then any [datetime] attr, then text pattern
+    # Date — G2 uses meta[itemprop="datePublished"], NOT <time> tags
     date = ""
-    date_el = card.find("time")
-    if date_el:
-        date = date_el.get("datetime", "") or _text(date_el)
-    if not date:
-        dt_el = card.find(attrs={"datetime": True})
-        if dt_el:
-            date = dt_el["datetime"]
-    if not date:
-        m = re.search(
-            r'\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4}\b',
-            _text(card), re.I,
-        )
-        if m:
-            date = m.group(0)
+    date_meta = card.find("meta", {"itemprop": "datePublished"})
+    if date_meta:
+        date = date_meta.get("content", "")
 
-    # Full review body
+    # Pros / Cons + full text — parse <section> elements inside reviewBody
+    # Remove "Review collected by and hosted on G2.com." spans before extracting text
+    pros = ""
+    cons = ""
+    text = ""
     body_el = card.find(attrs={"itemprop": "reviewBody"})
-    text = _text(body_el)[:2000] if body_el else ""
+    if body_el:
+        for spht in body_el.find_all("span", class_="spht"):
+            spht.decompose()
 
-    # Pros / Cons — primary: aria-label sections; fallback: regex-split text
-    pros_el = card.find(attrs={"aria-label": re.compile(r'^pros?$', re.I)})
-    cons_el = card.find(attrs={"aria-label": re.compile(r'^cons?$', re.I)})
-    pros = _text(pros_el)[:500] if pros_el else ""
-    cons = _text(cons_el)[:500] if cons_el else ""
+        for section in body_el.find_all("section"):
+            label_el = section.find(class_=re.compile(r'elv-font-bold', re.I))
+            label = _text(label_el).lower() if label_el else ""
+            answer = " ".join(_text(p) for p in section.find_all("p")).strip()
+            if "like best" in label:
+                pros = answer[:500]
+            elif "dislike" in label or "not like" in label:
+                cons = answer[:500]
+
+        text = _text(body_el)[:2000]
+
+    # Fallback: regex-split the full text if sections parsing didn't work
     if not pros and not cons and text:
         pros, cons = _split_review_text(text)
 
@@ -271,6 +263,9 @@ def _parse_review_card(card, index):
 
     if not text and not title:
         return None
+
+    # Verified — G2 shows "Verified by {Product}" badge
+    verified = bool(card.find(string=re.compile(r'\bVerified\s+by\b', re.I)))
 
     return {
         "id": f"g2-{index}",
@@ -282,7 +277,7 @@ def _parse_review_card(card, index):
         "date": date,
         "author": author,
         "author_title": author_title,
-        "verified": bool(card.find(string=re.compile(r'Verified\s+(?:Current\s+)?User', re.I))),
+        "verified": verified,
         "helpful_votes": 0,
         "platform": "g2",
     }
