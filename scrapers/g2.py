@@ -41,7 +41,7 @@ def _fetch_page(url: str) -> BeautifulSoup:
         timeout=_BD_TIMEOUT,
     )
     resp.raise_for_status()
-    return BeautifulSoup(resp.text, "lxml")
+    return BeautifulSoup(resp.text, "html.parser")
 
 
 def _fetch_rating_schema(slug: str) -> dict:
