@@ -44,6 +44,22 @@ def _fetch_page(url: str) -> BeautifulSoup:
     return BeautifulSoup(resp.text, "html.parser")
 
 
+def _fetch_page_raw(url: str):
+    """Returns (soup, raw_html) for callers that need regex fallbacks."""
+    resp = requests.post(
+        "https://api.brightdata.com/request",
+        headers={
+            "Authorization": f"Bearer {BRIGHTDATA_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={"zone": BRIGHTDATA_ZONE, "url": url, "format": "raw"},
+        timeout=_BD_TIMEOUT,
+    )
+    resp.raise_for_status()
+    raw = resp.text
+    return BeautifulSoup(raw, "html.parser"), raw
+
+
 def _fetch_rating_schema(slug: str) -> dict:
     resp = requests.get(
         f"https://www.g2.com/products/{slug}/rating_schema.json",
@@ -314,7 +330,7 @@ def get_product(slug: str) -> dict:
 
         # Bright Data: fill stars distribution, description, and any gaps
         try:
-            soup = _fetch_page(f"https://www.g2.com/products/{slug}/reviews")
+            soup, raw_html = _fetch_page_raw(f"https://www.g2.com/products/{slug}/reviews")
 
             if name == slug:
                 h1 = soup.find("h1")
@@ -330,16 +346,21 @@ def get_product(slug: str) -> dict:
             stars_dist = _stars_dist_from_page(soup)
 
             if not description:
-                # itemprop="description" div is the real product description
+                # Primary: <p itemprop="description"> — server-rendered product description
                 desc_el = soup.find(attrs={"itemprop": "description"})
                 if desc_el and desc_el.name != "meta":
                     description = _text(desc_el)[:500]
             if not description:
-                # meta og:description often says "Filter X reviews..." — skip
-                for sel in [{"name": "description"}, {"name": "twitter:description"}]:
-                    m = soup.find("meta", sel)
-                    if m and m.get("content", "").strip():
-                        cand = m["content"].strip()
+                # Regex fallback on raw HTML (handles html.parser edge cases)
+                m_rdesc = re.search(r'itemprop="description"[^>]*>([^<]{15,})<', raw_html)
+                if m_rdesc:
+                    description = m_rdesc.group(1).strip()[:500]
+            if not description:
+                # Last resort: meta description if it's not a filter/review-count page
+                for meta_sel in [{"name": "description"}, {"name": "twitter:description"}]:
+                    meta_el = soup.find("meta", meta_sel)
+                    if meta_el and meta_el.get("content", "").strip():
+                        cand = meta_el["content"].strip()
                         if not re.search(r'Filter\s+[\d,]+\s+reviews', cand, re.I):
                             description = cand[:500]
                             break
@@ -554,11 +575,16 @@ def get_alternatives(slug: str, limit: int = 5) -> dict:
         # Correct URL: /competitors/alternatives (not /competitors/highest_rated)
         soup = _fetch_page(f"https://www.g2.com/products/{slug}/competitors/alternatives")
 
-        # Each competitor card has:
-        # - elv-font-bold div with product name
-        # - label with "X.X/5" rating pattern after star SVGs
-        # Find all product review links; walk to card container for name + rating
-        for a in soup.find_all("a", href=re.compile(r'/products/[^/?#]+/reviews$')):
+        # G2 alternatives page: each card has TWO /reviews links —
+        #   (1) image/icon link (empty text)
+        #   (2) named link — contains an elv-font-bold div with the product name
+        # Only process named links so we get correct name and avoid breadcrumb links.
+        named_links = [
+            a for a in soup.find_all("a", href=re.compile(r'/products/[^/?#]+/reviews$'))
+            if a.find(class_=re.compile(r'elv-font-bold', re.I))
+        ]
+
+        for a in named_links:
             if len(alternatives) >= limit:
                 break
             href = a.get("href", "")
@@ -567,25 +593,16 @@ def get_alternatives(slug: str, limit: int = 5) -> dict:
                 continue
             seen.add(alt_slug)
 
-            # Walk up to card container (stop at a reasonable ancestor)
-            card = a.parent
-            for _ in range(6):
-                if not card or not card.parent:
-                    break
-                card = card.parent
-
-            # Product name — elv-font-bold div inside the card (near the link)
-            name = ""
+            # Name is directly inside the elv-font-bold div within the link
             name_el = a.find(class_=re.compile(r'elv-font-bold', re.I))
-            if not name_el and card:
-                name_el = card.find(class_=re.compile(r'elv-font-bold', re.I))
-            if name_el:
-                name = _text(name_el)[:100]
-            name = name or _text(a)[:100] or alt_slug.replace("-", " ").title()
+            name = _text(name_el)[:100] if name_el else (_text(a)[:100] or alt_slug.replace("-", " ").title())
 
-            # Rating — "X.X/5" label that appears after the star SVGs
+            # Rating — "X.X/5" label is a sibling in the same card container (level 0-2)
             alt_rating = 0.0
-            if card:
+            card = a.parent
+            for _ in range(4):
+                if not card:
+                    break
                 for lbl in card.find_all(["label", "span", "div"]):
                     t = _text(lbl)
                     m = re.match(r'^([\d.]+)/5$', t.strip())
@@ -594,6 +611,9 @@ def get_alternatives(slug: str, limit: int = 5) -> dict:
                         if 0 < v <= 5:
                             alt_rating = round(v, 1)
                         break
+                if alt_rating:
+                    break
+                card = card.parent
 
             alternatives.append({
                 "name": name,
@@ -633,44 +653,49 @@ def search_products(query: str, category: str = None, limit: int = 10) -> dict:
 
         soup = _fetch_page(url)
 
-        # G2 search results use quadrant grid (Leader, High Performer, etc.)
-        # Individual ratings aren't in static HTML — collect unique slugs + names
-        for a in soup.find_all("a", href=re.compile(r'/products/[^/?#]+/reviews')):
+        # G2 search/category pages use "x-software-component-card" divs for product listings.
+        # Each card contains the product name link, "X.X out of 5" rating, and description text.
+        for card in soup.find_all("div", class_=re.compile(r'x-software-component-card')):
             if len(products) >= limit:
                 break
-            href = a.get("href", "")
-            slug = _slug_from_url(href)
+
+            # Name + slug: text link to /products/.../reviews inside the card
+            slug = ""
+            name = ""
+            for a in card.find_all("a", href=re.compile(r'/products/[^/?#]+/reviews')):
+                if a.get_text(strip=True) and not a.find("img"):
+                    slug = _slug_from_url(a.get("href", ""))
+                    name = a.get_text(strip=True)[:100]
+                    break
             if not slug or slug in seen or "url_slug" in slug:
                 continue
             seen.add(slug)
-
-            name = _text(a).strip()[:100] or slug.replace("-", " ").title()
-            if not name or len(name) < 2:
+            if not name:
                 name = slug.replace("-", " ").title()
 
-            # Try to find X.X/5 rating label near this link (new elv-* design cards)
-            alt_rating = 0.0
-            card = a.parent
-            for _ in range(6):
-                if not card:
-                    break
-                for lbl in card.find_all(["label", "span"]):
-                    t = _text(lbl)
-                    m = re.match(r'^([\d.]+)/5$', t.strip())
-                    if m:
-                        v = _safe_float(m.group(1))
-                        if 0 < v <= 5:
-                            alt_rating = round(v, 1)
-                        break
-                if alt_rating:
-                    break
-                card = card.parent
+            # Rating: "X.X out of 5" in card text
+            card_text = card.get_text(separator=" ", strip=True)
+            prod_rating = 0.0
+            m_r = re.search(r'([\d.]+)\s+out\s+of\s+5', card_text, re.I)
+            if m_r:
+                v = _safe_float(m_r.group(1))
+                if 0 < v <= 5:
+                    prod_rating = round(v, 1)
+
+            # Description: text in "Product Description" section of the card
+            desc = ""
+            m_d = re.search(
+                r'Product Description\s+(.+?)(?:\s+Overview|\s+Pros and Cons|$)',
+                card_text, re.I | re.S,
+            )
+            if m_d:
+                desc = m_d.group(1).strip()[:300]
 
             products.append({
                 "name": name,
                 "slug": slug,
-                "rating": alt_rating,
-                "description": "",
+                "rating": prod_rating,
+                "description": desc,
                 "profile_url": f"https://www.g2.com/products/{slug}/reviews",
                 "platform": "g2",
             })
@@ -700,42 +725,48 @@ def get_category(slug: str, limit: int = 10) -> dict:
 
         soup = _fetch_page(f"https://www.g2.com/categories/{slug}")
 
-        for a in soup.find_all("a", href=re.compile(r'/products/[^/?#]+/reviews')):
+        # G2 category pages use "x-software-component-card" divs — same as search pages.
+        for card in soup.find_all("div", class_=re.compile(r'x-software-component-card')):
             if len(products) >= limit:
                 break
-            href = a.get("href", "")
-            prod_slug = _slug_from_url(href)
+
+            # Name + slug: text link (no img) to /products/.../reviews
+            prod_slug = ""
+            name = ""
+            for a in card.find_all("a", href=re.compile(r'/products/[^/?#]+/reviews')):
+                if a.get_text(strip=True) and not a.find("img"):
+                    prod_slug = _slug_from_url(a.get("href", ""))
+                    name = a.get_text(strip=True)[:100]
+                    break
             if not prod_slug or prod_slug in seen or "url_slug" in prod_slug:
                 continue
             seen.add(prod_slug)
-
-            name = _text(a).strip()[:100] or prod_slug.replace("-", " ").title()
-            if not name or len(name) < 2:
+            if not name:
                 name = prod_slug.replace("-", " ").title()
 
-            # Try X.X/5 label near this link (elv-* card design)
-            alt_rating = 0.0
-            card = a.parent
-            for _ in range(6):
-                if not card:
-                    break
-                for lbl in card.find_all(["label", "span"]):
-                    t = _text(lbl)
-                    m = re.match(r'^([\d.]+)/5$', t.strip())
-                    if m:
-                        v = _safe_float(m.group(1))
-                        if 0 < v <= 5:
-                            alt_rating = round(v, 1)
-                        break
-                if alt_rating:
-                    break
-                card = card.parent
+            # Rating: "X.X out of 5" in card text
+            card_text = card.get_text(separator=" ", strip=True)
+            prod_rating = 0.0
+            m_r = re.search(r'([\d.]+)\s+out\s+of\s+5', card_text, re.I)
+            if m_r:
+                v = _safe_float(m_r.group(1))
+                if 0 < v <= 5:
+                    prod_rating = round(v, 1)
+
+            # Description: text in "Product Description" section
+            desc = ""
+            m_d = re.search(
+                r'Product Description\s+(.+?)(?:\s+Overview|\s+Pros and Cons|$)',
+                card_text, re.I | re.S,
+            )
+            if m_d:
+                desc = m_d.group(1).strip()[:300]
 
             products.append({
                 "name": name,
                 "slug": prod_slug,
-                "rating": alt_rating,
-                "description": "",
+                "rating": prod_rating,
+                "description": desc,
                 "profile_url": f"https://www.g2.com/products/{prod_slug}/reviews",
                 "platform": "g2",
             })
