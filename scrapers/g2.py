@@ -221,6 +221,16 @@ def _parse_review_card(card, index):
     if rating_meta:
         rating_val = int(_safe_float(rating_meta.get("content", 0)) + 0.5)
 
+    # Fallback: aria-label "X out of 5" on star elements within the card
+    if not rating_val:
+        for el in card.find_all(attrs={"aria-label": True}):
+            m = re.search(r'([\d.]+)\s+out\s+of\s+5', el.get("aria-label", ""), re.I)
+            if m:
+                rating_val = int(_safe_float(m.group(1)) + 0.5)
+                if 1 <= rating_val <= 5:
+                    break
+                rating_val = 0
+
     # Title — div[itemprop="name"], NOT the meta tag inside itemprop="author"
     title = ""
     title_el = card.find("div", attrs={"itemprop": "name"})
@@ -427,12 +437,19 @@ def get_reviews(slug: str, limit: int = 20, rating: int = None, sort: str = "mos
                 continue
             reviews.append(parsed)
 
+        stars_dist = {"1": 0, "2": 0, "3": 0, "4": 0, "5": 0}
+        for r in reviews:
+            rv = r.get("rating")
+            if rv and 1 <= rv <= 5:
+                stars_dist[str(rv)] += 1
+
         return {
             "status": "success",
             "data": {
                 "slug": slug,
                 "returned": len(reviews),
                 "reviews": reviews,
+                "stars_distribution": stars_dist,
                 "platform": "g2",
             },
         }
