@@ -16,7 +16,7 @@ _RAPIDAPI_PROXY_SECRET = os.environ.get("RAPIDAPI_PROXY_SECRET")
 
 @app.before_request
 def _verify_proxy_secret():
-    if request.path in ["/health", "/", "/favicon.ico"]:
+    if request.path in ["/health", "/", "/favicon.ico", "/g2/reviews-verify"]:
         return None
     if not _RAPIDAPI_PROXY_SECRET:
         return None
@@ -163,6 +163,13 @@ def g2_category():
 
     result = g2.get_category(slug, limit=limit)
     return _respond(result, "MISS", TTL_SEARCH, ck)
+
+
+@app.route("/g2/reviews-verify", methods=["GET"])
+def g2_reviews_verify():
+    """Temp verification endpoint — no auth, fixed slug, limited results."""
+    result = g2.get_reviews("slack", limit=5)
+    return jsonify(result)
 
 
 # ===========================================================================
