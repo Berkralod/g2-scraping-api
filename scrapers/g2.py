@@ -192,6 +192,34 @@ def _stars_dist_from_page(soup):
         if m and score.isdigit() and 1 <= int(score) <= 5:
             dist[score] = _safe_int(m.group(1))
 
+    if any(v > 0 for v in dist.values()):
+        return dist
+
+    # Strategy 4: "X stars (N)" or "X stars: N" filter links/buttons — absolute counts
+    for star in range(5, 0, -1):
+        m = re.search(rf'{star}\s*stars?\s*[:(]\s*([\d,]+)', html, re.I)
+        if m:
+            dist[str(star)] = _safe_int(m.group(1))
+
+    if any(v > 0 for v in dist.values()):
+        return dist
+
+    # Strategy 5: inline style width percentage near a star label
+    # Handles: <div style="width:62%"> near "5 star" text
+    for el in soup.find_all(style=re.compile(r'width\s*:\s*\d+\s*%', re.I)):
+        style = el.get("style", "")
+        m_pct = re.search(r'width\s*:\s*(\d+)\s*%', style, re.I)
+        if not m_pct:
+            continue
+        pct = _safe_int(m_pct.group(1))
+        if pct == 0 or pct > 100:
+            continue
+        parent_text = _text(el.parent) if el.parent else ""
+        for star in range(5, 0, -1):
+            if re.search(rf'\b{star}\s*stars?\b', parent_text, re.I):
+                dist[str(star)] = pct
+                break
+
     return dist
 
 
@@ -215,21 +243,25 @@ def _split_review_text(text):
 
 
 def _parse_review_card(card, index):
-    # Rating — meta[itemprop="ratingValue"] is on 0-5 scale for individual reviews
+    # Rating — normalize to 1-5 regardless of whether G2 uses 0-5 or 0-10 scale
     rating_val = 0
     rating_meta = card.find("meta", {"itemprop": "ratingValue"})
     if rating_meta:
-        rating_val = int(_safe_float(rating_meta.get("content", 0)) + 0.5)
+        v = _safe_float(rating_meta.get("content", 0))
+        if 0 < v <= 5:
+            rating_val = int(v + 0.5)
+        elif 0 < v <= 10:
+            rating_val = int(round(v / 2))
 
     # Fallback: aria-label "X out of 5" on star elements within the card
     if not rating_val:
         for el in card.find_all(attrs={"aria-label": True}):
             m = re.search(r'([\d.]+)\s+out\s+of\s+5', el.get("aria-label", ""), re.I)
             if m:
-                rating_val = int(_safe_float(m.group(1)) + 0.5)
-                if 1 <= rating_val <= 5:
+                v = _safe_float(m.group(1))
+                if 0 < v <= 5:
+                    rating_val = int(v + 0.5)
                     break
-                rating_val = 0
 
     # Title — div[itemprop="name"], NOT the meta tag inside itemprop="author"
     title = ""
