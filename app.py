@@ -177,18 +177,35 @@ def g2_reviews_verify():
         resp = _req.post(
             "https://api.brightdata.com/request",
             headers={"Authorization": f"Bearer {bd_key}", "Content-Type": "application/json"},
-            json={"zone": bd_zone, "url": url, "format": "raw"},
+            json={
+                "zone": bd_zone,
+                "url": url,
+                "format": "raw",
+                "country": "us",
+                "headers": {
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"
+                    ),
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Referer": "https://www.google.com/",
+                },
+            },
             timeout=90,
         )
         raw = resp.text
         raw_bytes = resp.content
+        has_reviews = "itemprop=\"review\"" in raw or "ratingValue" in raw
         return jsonify({
             "bd_key_set": bool(bd_key),
             "bd_status": resp.status_code,
             "html_len": len(raw),
             "bytes_len": len(raw_bytes),
-            "headers": dict(resp.headers),
-            "html_sample": raw[:500] or raw_bytes[:200].decode("utf-8", errors="replace"),
+            "has_reviews": has_reviews,
+            "brd_error": resp.headers.get("x-brd-error", ""),
+            "html_sample": raw[:800] if raw else raw_bytes[:200].decode("utf-8", errors="replace"),
         })
     except Exception as e:
         return jsonify({"error": str(e), "bd_key_set": bool(bd_key)})
