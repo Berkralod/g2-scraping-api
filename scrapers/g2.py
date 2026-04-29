@@ -30,22 +30,33 @@ _SCHEMA_TIMEOUT = 8    # rating_schema.json is tiny
 # Core fetch helpers
 # ---------------------------------------------------------------------------
 
-def _fetch_page(url: str) -> BeautifulSoup:
-    resp = requests.post(
-        "https://api.brightdata.com/request",
-        headers={
-            "Authorization": f"Bearer {BRIGHTDATA_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={"zone": BRIGHTDATA_ZONE, "url": url, "format": "raw"},
-        timeout=_BD_TIMEOUT,
-    )
+_DIRECT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+}
+_DIRECT_TIMEOUT = 20
+
+
+def _fetch_direct_raw(url: str):
+    """Direct fetch with browser headers — no proxy. Returns (soup, raw_html) or raises."""
+    resp = requests.get(url, headers=_DIRECT_HEADERS, timeout=_DIRECT_TIMEOUT)
     resp.raise_for_status()
-    return BeautifulSoup(resp.text, "html.parser")
+    raw = resp.text
+    if len(raw) < 500:
+        raise ValueError(f"Direct fetch returned too-short response ({len(raw)} bytes)")
+    return BeautifulSoup(raw, "html.parser"), raw
 
 
-def _fetch_page_raw(url: str):
-    """Returns (soup, raw_html) for callers that need regex fallbacks."""
+def _fetch_bd_raw(url: str):
+    """Bright Data Web Unlocker fetch. Returns (soup, raw_html) or raises."""
     resp = requests.post(
         "https://api.brightdata.com/request",
         headers={
@@ -57,7 +68,24 @@ def _fetch_page_raw(url: str):
     )
     resp.raise_for_status()
     raw = resp.text
+    if not raw or len(raw) < 500:
+        err = resp.headers.get("x-brd-error", resp.headers.get("x-luminati-error", "empty response"))
+        raise ValueError(f"BD returned empty/blocked response: {err}")
     return BeautifulSoup(raw, "html.parser"), raw
+
+
+def _fetch_page_raw(url: str):
+    """Returns (soup, raw_html). Tries direct fetch first, falls back to Bright Data."""
+    try:
+        return _fetch_direct_raw(url)
+    except Exception:
+        pass
+    return _fetch_bd_raw(url)
+
+
+def _fetch_page(url: str) -> BeautifulSoup:
+    soup, _ = _fetch_page_raw(url)
+    return soup
 
 
 def _fetch_rating_schema(slug: str) -> dict:
