@@ -410,7 +410,7 @@ def get_product(slug: str) -> dict:
 def get_reviews(slug: str, limit: int = 20, rating: int = None, sort: str = "most_recent") -> dict:
     try:
         reviews = []
-        soup = _fetch_page(f"https://www.g2.com/products/{slug}/reviews")
+        soup, raw_html = _fetch_page_raw(f"https://www.g2.com/products/{slug}/reviews")
 
         # Primary: itemprop="review" sections
         cards = soup.find_all(attrs={"itemprop": "review"})
@@ -437,11 +437,16 @@ def get_reviews(slug: str, limit: int = 20, rating: int = None, sort: str = "mos
                 continue
             reviews.append(parsed)
 
+        # Compute stars_distribution from individual reviews first
         stars_dist = {"1": 0, "2": 0, "3": 0, "4": 0, "5": 0}
         for r in reviews:
             rv = r.get("rating")
             if rv and 1 <= rv <= 5:
                 stars_dist[str(rv)] += 1
+
+        # Fallback: parse aggregate distribution from page HTML (always present in server-rendered HTML)
+        if not any(v > 0 for v in stars_dist.values()):
+            stars_dist = _stars_dist_from_page(soup)
 
         return {
             "status": "success",
