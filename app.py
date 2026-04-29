@@ -167,9 +167,24 @@ def g2_category():
 
 @app.route("/g2/reviews-verify", methods=["GET"])
 def g2_reviews_verify():
-    """Temp verification endpoint — no auth."""
+    """Temp verification endpoint — no auth. Tests get_reviews() directly."""
     import os, requests as _req
     slug = request.args.get("slug", "slack")
+    # Call actual get_reviews() and return stars_distribution result
+    result = g2.get_reviews(slug, limit=5)
+    if result.get("status") == "success":
+        data = result["data"]
+        return jsonify({
+            "status": "success",
+            "slug": slug,
+            "returned": data.get("returned"),
+            "stars_distribution": data.get("stars_distribution"),
+            "stars_distribution_source": data.get("stars_distribution_source"),
+            "has_nonzero_dist": any(v > 0 for v in data.get("stars_distribution", {}).values()),
+        })
+    return jsonify(result)
+
+    # Legacy BD debug (unreachable but kept for reference)
     bd_key = os.getenv("BRIGHTDATA_API_KEY", "")
     bd_zone = os.getenv("BRIGHTDATA_ZONE", "web_unlocker1")
     url = f"https://www.g2.com/products/{slug}/reviews"
