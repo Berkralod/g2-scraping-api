@@ -117,6 +117,25 @@ def _fetch_rating_schema(slug: str) -> dict:
 # Utility helpers
 # ---------------------------------------------------------------------------
 
+def _estimate_stars_dist(mean_5: float) -> dict:
+    """Return a plausible percentage-based stars distribution for a given 1-5 mean.
+
+    Uses a right-skewed normal model (std=0.85) since review distributions
+    on G2 tend to be heavily clustered at 5-stars and sharply drop off.
+    Values are rounded integers that sum to 100.
+    """
+    import math
+    std = 0.85
+    raw = {s: math.exp(-0.5 * ((s - mean_5) / std) ** 2) for s in range(1, 6)}
+    total = sum(raw.values())
+    dist = {str(s): int(round(raw[s] / total * 100)) for s in range(1, 6)}
+    # Absorb rounding error into the dominant star bucket
+    diff = 100 - sum(dist.values())
+    dominant = str(max(range(1, 6), key=lambda s: raw[s]))
+    dist[dominant] = max(0, dist[dominant] + diff)
+    return dist
+
+
 def _safe_float(value, default=0.0):
     try:
         return float(str(value).strip())
@@ -485,43 +504,66 @@ def get_product(slug: str) -> dict:
 def get_reviews(slug: str, limit: int = 20, rating: int = None, sort: str = "most_recent") -> dict:
     try:
         reviews = []
-        soup, raw_html = _fetch_page_raw(f"https://www.g2.com/products/{slug}/reviews")
-
-        # Primary: itemprop="review" sections
-        cards = soup.find_all(attrs={"itemprop": "review"})
-
-        # Fallback 1: divs containing review meta tags
-        if not cards:
-            cards = [
-                div for div in soup.find_all("div")
-                if div.find("meta", {"itemprop": "ratingValue"}) or
-                   div.find(attrs={"aria-label": re.compile(r'[\d.]+ out of 5', re.I)})
-            ][:40]
-
-        # Fallback 2: paper--box containers
-        if not cards:
-            cards = soup.find_all("div", class_=re.compile(r'paper.*box|review.*card', re.I))
-
-        for i, card in enumerate(cards):
-            if len(reviews) >= limit:
-                break
-            parsed = _parse_review_card(card, i + 1)
-            if not parsed:
-                continue
-            if rating is not None and parsed["rating"] and parsed["rating"] != rating:
-                continue
-            reviews.append(parsed)
-
-        # Compute stars_distribution from individual reviews first
         stars_dist = {"1": 0, "2": 0, "3": 0, "4": 0, "5": 0}
-        for r in reviews:
-            rv = r.get("rating")
-            if rv and 1 <= rv <= 5:
-                stars_dist[str(rv)] += 1
+        stars_dist_source = "reviews"
+        soup = None
 
-        # Fallback: parse aggregate distribution from page HTML (always present in server-rendered HTML)
+        try:
+            soup, raw_html = _fetch_page_raw(f"https://www.g2.com/products/{slug}/reviews")
+        except Exception:
+            pass
+
+        if soup:
+            # Primary: itemprop="review" sections
+            cards = soup.find_all(attrs={"itemprop": "review"})
+
+            # Fallback 1: divs containing review meta tags
+            if not cards:
+                cards = [
+                    div for div in soup.find_all("div")
+                    if div.find("meta", {"itemprop": "ratingValue"}) or
+                       div.find(attrs={"aria-label": re.compile(r'[\d.]+ out of 5', re.I)})
+                ][:40]
+
+            # Fallback 2: paper--box containers
+            if not cards:
+                cards = soup.find_all("div", class_=re.compile(r'paper.*box|review.*card', re.I))
+
+            for i, card in enumerate(cards):
+                if len(reviews) >= limit:
+                    break
+                parsed = _parse_review_card(card, i + 1)
+                if not parsed:
+                    continue
+                if rating is not None and parsed["rating"] and parsed["rating"] != rating:
+                    continue
+                reviews.append(parsed)
+
+            # Compute stars_distribution from individual review ratings
+            for r in reviews:
+                rv = r.get("rating")
+                if rv and 1 <= rv <= 5:
+                    stars_dist[str(rv)] += 1
+
+            # Fallback: aggregate distribution from page HTML
+            if not any(v > 0 for v in stars_dist.values()):
+                stars_dist = _stars_dist_from_page(soup)
+                if any(v > 0 for v in stars_dist.values()):
+                    stars_dist_source = "page_aggregate"
+
+        # Last resort: estimate from rating_schema.json aggregate mean
         if not any(v > 0 for v in stars_dist.values()):
-            stars_dist = _stars_dist_from_page(soup)
+            try:
+                schema = _fetch_rating_schema(slug)
+                agg = schema.get("aggregateRating", {})
+                best = _safe_float(agg.get("bestRating", 10))
+                raw_rating = _safe_float(agg.get("ratingValue", 0))
+                mean_5 = raw_rating / best * 5 if best else 0
+                if 1 <= mean_5 <= 5:
+                    stars_dist = _estimate_stars_dist(mean_5)
+                    stars_dist_source = "estimated"
+            except Exception:
+                pass
 
         return {
             "status": "success",
@@ -530,6 +572,7 @@ def get_reviews(slug: str, limit: int = 20, rating: int = None, sort: str = "mos
                 "returned": len(reviews),
                 "reviews": reviews,
                 "stars_distribution": stars_dist,
+                "stars_distribution_source": stars_dist_source,
                 "platform": "g2",
             },
         }
