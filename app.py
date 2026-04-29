@@ -168,8 +168,23 @@ def g2_category():
 @app.route("/g2/reviews-verify", methods=["GET"])
 def g2_reviews_verify():
     """Temp verification endpoint — no auth, fixed slug, limited results."""
-    result = g2.get_reviews("slack", limit=5)
-    return jsonify(result)
+    from scrapers.g2 import _fetch_page_raw, _stars_dist_from_page
+    slug = request.args.get("slug", "slack")
+    try:
+        soup, raw_html = _fetch_page_raw(f"https://www.g2.com/products/{slug}/reviews")
+        cards = soup.find_all(attrs={"itemprop": "review"})
+        stars = _stars_dist_from_page(soup)
+        sample = raw_html[:500]
+        title = soup.find("title")
+        return jsonify({
+            "title": title.get_text() if title else None,
+            "html_len": len(raw_html),
+            "review_cards_found": len(cards),
+            "stars_dist": stars,
+            "html_sample": sample,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)})
 
 
 # ===========================================================================
