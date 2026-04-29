@@ -167,24 +167,28 @@ def g2_category():
 
 @app.route("/g2/reviews-verify", methods=["GET"])
 def g2_reviews_verify():
-    """Temp verification endpoint — no auth, fixed slug, limited results."""
-    from scrapers.g2 import _fetch_page_raw, _stars_dist_from_page
+    """Temp verification endpoint — no auth."""
+    import os, requests as _req
     slug = request.args.get("slug", "slack")
+    bd_key = os.getenv("BRIGHTDATA_API_KEY", "")
+    bd_zone = os.getenv("BRIGHTDATA_ZONE", "web_unlocker1")
+    url = f"https://www.g2.com/products/{slug}/reviews"
     try:
-        soup, raw_html = _fetch_page_raw(f"https://www.g2.com/products/{slug}/reviews")
-        cards = soup.find_all(attrs={"itemprop": "review"})
-        stars = _stars_dist_from_page(soup)
-        sample = raw_html[:500]
-        title = soup.find("title")
+        resp = _req.post(
+            "https://api.brightdata.com/request",
+            headers={"Authorization": f"Bearer {bd_key}", "Content-Type": "application/json"},
+            json={"zone": bd_zone, "url": url, "format": "raw"},
+            timeout=90,
+        )
+        raw = resp.text
         return jsonify({
-            "title": title.get_text() if title else None,
-            "html_len": len(raw_html),
-            "review_cards_found": len(cards),
-            "stars_dist": stars,
-            "html_sample": sample,
+            "bd_key_set": bool(bd_key),
+            "bd_status": resp.status_code,
+            "html_len": len(raw),
+            "html_sample": raw[:300],
         })
     except Exception as e:
-        return jsonify({"error": str(e)})
+        return jsonify({"error": str(e), "bd_key_set": bool(bd_key)})
 
 
 # ===========================================================================
