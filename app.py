@@ -181,11 +181,14 @@ def g2_reviews_verify():
             timeout=90,
         )
         raw = resp.text
+        raw_bytes = resp.content
         return jsonify({
             "bd_key_set": bool(bd_key),
             "bd_status": resp.status_code,
             "html_len": len(raw),
-            "html_sample": raw[:300],
+            "bytes_len": len(raw_bytes),
+            "headers": dict(resp.headers),
+            "html_sample": raw[:500] or raw_bytes[:200].decode("utf-8", errors="replace"),
         })
     except Exception as e:
         return jsonify({"error": str(e), "bd_key_set": bool(bd_key)})
